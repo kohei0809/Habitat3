@@ -85,6 +85,8 @@ class Env:
         self._config = config
         self._dataset = dataset
         if self._dataset is None and config.dataset.type:
+            print("BBBBBBBBBBBBBBBBBBBB")
+            print(config.dataset.type)
             self._dataset = make_dataset(
                 id_dataset=config.dataset.type, config=config.dataset
             )

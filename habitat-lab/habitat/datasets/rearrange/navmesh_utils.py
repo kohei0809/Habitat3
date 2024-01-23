@@ -230,6 +230,7 @@ class SimpleVelocityControlEnv:
 
         :return: The updated agent transformation matrix.
         """
+        print("bbb")
         linear_velocity = vel[0]
         angular_velocity = vel[1]
         # Map velocity actions

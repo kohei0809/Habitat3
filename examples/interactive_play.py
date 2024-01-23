@@ -46,6 +46,7 @@ Record and play back trajectories:
 
 import argparse
 import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import os.path as osp
 import time
 from collections import defaultdict
@@ -80,7 +81,9 @@ except ImportError:
 
 # Please reach out to the paper authors to obtain this file
 DEFAULT_POSE_PATH = "data/humanoids/humanoid_data/walking_motion_processed.pkl"
+DEFAULT_POSE_PATH = "data/humanoids/humanoid_data/walking_motion_processed_smplx.pkl"
 DEFAULT_CFG = "benchmark/rearrange/play/play.yaml"
+DEFAULT_CFG = "benchmark/nav/pointnav/pointnav_mp3d.yaml"
 DEFAULT_RENDER_STEPS_LIMIT = 60
 SAVE_VIDEO_DIR = "./data/vids"
 SAVE_ACTIONS_DIR = "./data/interactive_play_replays"
