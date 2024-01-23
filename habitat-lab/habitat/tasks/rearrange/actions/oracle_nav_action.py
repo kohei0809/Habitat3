@@ -276,7 +276,6 @@ class SimpleVelocityControlEnv:
         self._sim_freq = sim_freq
 
     def act(self, trans, vel):
-        print("aaa")
         linear_velocity = vel[0]
         angular_velocity = vel[1]
         # Map velocity actions

@@ -21,6 +21,10 @@ import numpy as np
 from magnum import shaders, text
 from magnum.platform.glfw import Application
 
+from omegaconf import DictConfig
+import habitat
+import habitat.articulated_agents.humanoids.kinematic_humanoid as kinematic_humanoid
+
 import habitat_sim
 from habitat_sim import ReplayRenderer, ReplayRendererConfiguration, physics
 from habitat_sim.logging import LoggingContext, logger
@@ -362,6 +366,57 @@ class HabitatSimInteractiveViewer(Application):
             for _i in range(self.num_env):
                 self.tiled_sims.append(habitat_sim.Simulator(self.cfg))
             self.sim = self.tiled_sims[0]
+
+            # setup the camera for debug video (looking at 0,0,0)
+            #self.sim.agents[0].scene_node.translation = [0.0, -1.0, 2.0]
+            
+            # 人間をオブジェクトとして追加
+            """
+            obj_templates_mgr = self.sim.get_object_template_manager()
+            rigid_obj_mgr = self.sim.get_rigid_object_manager()
+            sphere_template_id = obj_templates_mgr.load_configs("data/humanoids/humanoid_data/male_0")[0]
+            obj_1 = rigid_obj_mgr.add_object_by_template_id(sphere_template_id)
+            obj_1.translation = [7.6, 3.5, -3.9]
+            obj_1.rotation = mn.Quaternion.rotation(mn.Deg(-90), mn.Vector3.x_axis())
+            #obj_1.rotation = mn.Quaternion({0, 0, 0}, 1)
+            print(mn.Deg(0))
+            print(mn.Vector3.y_axis())
+            print(mn.Vector3(0, -1, 0))
+            print(obj_1.rotation)
+            print("aaa")
+            agent = self.sim.agents[self.agent_id]
+            print(agent.state.rotation)
+            """
+
+            # add the humanoid to the world via the wrapper
+            
+            humanoid_name = "male_0"
+            humanoid_path = f"data/humanoids/humanoid_data/{humanoid_name}/{humanoid_name}.urdf"
+            walk_pose_path = f"data/humanoids/humanoid_data/{humanoid_name}/{humanoid_name}_motion_data_smplx.pkl"
+
+            agent_config = DictConfig(
+                {
+                    "articulated_agent_urdf": humanoid_path,
+                    "motion_data_path": walk_pose_path,
+                }
+            )
+
+            self.kin_humanoid = kinematic_humanoid.KinematicHumanoid(agent_config, self.sim, pose="walk_motion")
+            print("JOINT")
+            #print(kin_humanoid.sim_obj.joint_positions)
+            self.kin_humanoid.reconfigure()
+            self.kin_humanoid.update()
+            self.kin_humanoid.base_pos = mn.Vector3(7.6, 3.5, -3.9)
+            #mn.Vector3(7.6, 3.5, -3.9) -> mn.Vector3(7.6, 3.5, 3.3)
+            #kin_humanoid.base_pos = mn.Vector3(4, 3.5, 3.9)
+            
+            self.step_x_list = np.arange(-3.9, 4.0, 0.01)
+            self.x_index = 1
+            #step_y_list = np.arange(-3.9, 3.9, )
+            print(self.kin_humanoid.get_joint_transform()[0])
+            print("--------------")
+            print(self.kin_humanoid._fixed_base)
+            
         else:  # edge case
             for i in range(self.num_env):
                 if (
@@ -445,6 +500,15 @@ class HabitatSimInteractiveViewer(Application):
         if self.mouse_grabber is not None:
             # update location of grabbed object
             self.update_grab_position(self.previous_mouse_point)
+            
+        self.kin_humanoid.base_pos = mn.Vector3(7.6, 3.5, self.step_x_list[self.x_index])
+        self.x_index += 1
+        if self.x_index == self.step_x_list.shape[0]:
+            print("over")
+            print(self.kin_humanoid.base_rot)
+            self.step_x_list = self.step_x_list[::-1]
+            self.x_index = 0
+            self.kin_humanoid.base_rot = -self.kin_humanoid.base_rot
             
 
     def invert_gravity(self) -> None:
@@ -916,7 +980,7 @@ class HabitatSimInteractiveViewer(Application):
             mouse_mode_string = "GRAB"
             
         state = self.sim.agents[self.agent_id].state
-            
+        
         self.window_text.render(
             f"""
 {self.fps} FPS
@@ -1194,5 +1258,6 @@ if __name__ == "__main__":
     sim_settings["default_agent_navmesh"] = False
     sim_settings["enable_hbao"] = args.hbao
 
+    print(sim_settings)
     # start the application
     HabitatSimInteractiveViewer(sim_settings).exec()

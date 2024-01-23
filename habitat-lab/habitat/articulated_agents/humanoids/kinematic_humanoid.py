@@ -57,7 +57,7 @@ class KinematicHumanoid(MobileManipulator):
         )
 
     def __init__(
-        self, agent_cfg, sim, limit_robo_joints=False, fixed_base=False
+        self, agent_cfg, sim, limit_robo_joints=False, fixed_base=False, pose="stop_pose"
     ):
         super().__init__(
             self._get_humanoid_params(),
@@ -85,17 +85,21 @@ class KinematicHumanoid(MobileManipulator):
         self.offset_transform_base = perm @ add_rot
 
         self.rest_joints = None
-        self._set_rest_pose_path(agent_cfg.motion_data_path)
+        self._set_rest_pose_path(agent_cfg.motion_data_path, pose)
 
-    def _set_rest_pose_path(self, rest_pose_path):
+    def _set_rest_pose_path(self, rest_pose_path, pose):
         """Sets the parameters that indicate the reset state of the agent. Note that this function overrides
         _get_X_params, which is used to set parameters of the robots, but the parameters are so large that
         it is better to put that on a file
         """
         with open(rest_pose_path, "rb") as f:
             rest_pose = pkl.load(f)
-            rest_pose = rest_pose["stop_pose"]
-        self.rest_joints = list(rest_pose["joints"].reshape(-1))
+            rest_pose = rest_pose[pose]
+
+        if pose == "walk_motion":
+            self.rest_joints = list(rest_pose["joints_array"].reshape(-1))
+        elif pose == "stop_pose":
+            self.rest_joints = list(rest_pose["joints"].reshape(-1))
 
     @property
     def inverse_offset_transform(self):
