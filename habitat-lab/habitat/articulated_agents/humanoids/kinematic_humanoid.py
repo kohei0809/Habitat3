@@ -84,7 +84,11 @@ class KinematicHumanoid(MobileManipulator):
         self.offset_transform_base = perm @ add_rot
 
         self.rest_joints = None
-        self._set_rest_pose_path(agent_cfg.motion_data_path, pose)
+        self.agent_cfg = agent_cfg
+        self._set_rest_pose_path(self.agent_cfg.motion_data_path, pose)
+        
+    def change_pose(self, pose):
+        self._set_rest_pose_path(self.agent_cfg.motion_data_path, pose)
 
     def _set_rest_pose_path(self, rest_pose_path, pose):
         """Sets the parameters that indicate the reset state of the agent. Note that this function overrides

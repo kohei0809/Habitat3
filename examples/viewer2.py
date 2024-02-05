@@ -10,12 +10,14 @@ os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import string
 import sys
 import time
+import torch
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 flags = sys.getdlopenflags()
 sys.setdlopenflags(flags | ctypes.RTLD_GLOBAL)
 
+import hydra
 import magnum as mn
 import numpy as np
 from magnum import shaders, text
@@ -30,7 +32,40 @@ from habitat_sim import ReplayRenderer, ReplayRendererConfiguration, physics
 from habitat_sim.logging import LoggingContext, logger
 from habitat_sim.utils.common import quat_from_angle_axis
 from habitat_sim.utils.settings import default_sim_settings, make_cfg
+from habitat_baselines.common.baseline_registry import baseline_registry
+from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+from habitat_baselines.rl.ddppo.ddp_utils import (
+    SAVE_STATE,
+    add_signal_handlers,
+    is_slurm_batch_job,
+    load_resume_state,
+    save_resume_state,
+)
+from habitat_baselines.utils.common import (
+    get_checkpoint_id,
+    poll_checkpoint_folder,
+)
+from habitat.config import read_write
+from habitat_baselines.common.obs_transformers import (
+    apply_obs_transforms_batch,
+    apply_obs_transforms_obs_space,
+    get_active_obs_transforms,
+)
 
+
+class SimpleRLEnv(habitat.RLEnv):
+    def get_reward_range(self):
+        return [-1, 1]
+
+    def get_reward(self, observations):
+        return 0
+
+    def get_done(self, observations):
+        return self.habitat_env.episode_over
+
+    def get_info(self, observations):
+        return self.habitat_env.get_metrics()
+    
 
 class HabitatSimInteractiveViewer(Application):
     # the maximum number of chars displayable in the app window
@@ -50,8 +85,10 @@ class HabitatSimInteractiveViewer(Application):
     # CPU and GPU usage info
     DISPLAY_FONT_SIZE = 16.0
 
-    def __init__(self, sim_settings: Dict[str, Any]) -> None:
+    def __init__(self, sim_settings: Dict[str, Any], env) -> None:
+        print("XXXXXXXXXXXXXXXXXXX")
         self.sim_settings: Dict[str:Any] = sim_settings
+        self.env = env
 
         self.enable_batch_renderer: bool = self.sim_settings["enable_batch_renderer"]
         self.num_env: int = (
@@ -69,6 +106,8 @@ class HabitatSimInteractiveViewer(Application):
         configuration.size = window_size
         Application.__init__(self, configuration)
         self.fps: float = 60.0
+        
+        print("UUUUUUUUUUUUUUUU")
 
         # Compute environment camera resolution based on the number of environments to render in the window.
         grid_size: mn.Vector2i = ReplayRenderer.environment_grid_size(self.num_env)
@@ -84,6 +123,8 @@ class HabitatSimInteractiveViewer(Application):
         self.contact_debug_draw = False
         # cache most recently loaded URDF file for quick-reload
         self.cached_urdf = ""
+        
+        print("ZZZZZZZZZZZZZZZZZZZZ")
 
         # set up our movement map
         key = Application.KeyEvent.Key
@@ -122,6 +163,8 @@ class HabitatSimInteractiveViewer(Application):
             os.path.join(os.path.dirname(__file__), relative_path_to_font),
             13,
         )
+        
+        print("JJJJJJJJJJJJJJJJJJJ")
 
         # Glyphs we need to render everything
         self.glyph_cache = text.GlyphCache(mn.Vector2i(256), mn.Vector2i(1))
@@ -301,7 +344,8 @@ class HabitatSimInteractiveViewer(Application):
         """
         make_action_spec = habitat_sim.agent.ActionSpec
         make_actuation_spec = habitat_sim.agent.ActuationSpec
-        MOVE, LOOK = 0.07, 1.5
+        #MOVE, LOOK = 0.07, 1.5
+        MOVE, LOOK = 0.05, math.pi/12
 
         # all of our possible actions' names
         action_list = [
@@ -339,6 +383,148 @@ class HabitatSimInteractiveViewer(Application):
             body_type="cylinder",
         )
         return agent_config
+    
+    def _add_preemption_signal_handlers(self):
+        if is_slurm_batch_job():
+            add_signal_handlers()
+            
+    def load_checkpoint(self, checkpoint_path: str, *args, **kwargs) -> Dict:
+        return torch.load(checkpoint_path, *args, **kwargs)
+    
+    def _get_resume_state_config_or_new_config(
+        self, resume_state_config: "DictConfig"
+    ):
+        if self.config.habitat_baselines.load_resume_state_config:
+            if self.config != resume_state_config:
+                logger.warning(
+                    "\n##################\n"
+                    "You are attempting to resume training with a different "
+                    "configuration than the one used for the original training run. "
+                    "Since load_resume_state_config=True, the ORIGINAL configuration "
+                    "will be used and the new configuration will be IGNORED."
+                    "##################\n"
+                )
+            return resume_state_config
+        return self.config.copy()
+    
+    def _create_obs_transforms(self):
+        self.obs_transforms = get_active_obs_transforms(self.config)
+        self._env_spec.observation_space = apply_obs_transforms_obs_space(
+            self._env_spec.observation_space, self.obs_transforms
+        )
+    
+    def _create_agent(self, resume_state, **kwargs):
+        self._create_obs_transforms()
+        return baseline_registry.get_agent_access_mgr(
+            self.config.habitat_baselines.rl.agent.type
+        )(
+            config=self.config,
+            env_spec=self._env_spec,
+            is_distrib=self._is_distributed,
+            device=self.device,
+            resume_state=resume_state,
+            num_envs=self.envs.num_envs,
+            percent_done_fn=self.percent_done,
+            **kwargs,
+        )
+        
+    def _init_envs(self, config=None, is_eval: bool = False):
+        if config is None:
+            config = self.config
+
+        env_factory: VectorEnvFactory = hydra.utils.instantiate(
+            config.habitat_baselines.vector_env_factory
+        )
+        self.envs = env_factory.construct_envs(
+            config,
+            workers_ignore_signals=is_slurm_batch_job(),
+            enforce_scenes_greater_eq_environments=is_eval,
+            is_first_rank=(
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ),
+        )
+
+        self._env_spec = EnvironmentSpec(
+            observation_space=self.envs.observation_spaces[0],
+            action_space=self.envs.action_spaces[0],
+            orig_action_space=self.envs.orig_action_spaces[0],
+        )
+
+        # The measure keys that should only be logged on rank0 and nowhere
+        # else. They will be excluded from all other workers and only reported
+        # from the single worker.
+        self._rank0_keys: Set[str] = set(
+            list(self.config.habitat.task.rank0_env0_measure_names)
+            + list(self.config.habitat.task.rank0_measure_names)
+        )
+
+        # Information on measures that declared in `self._rank0_keys` or
+        # to be only reported on rank0. This is seperately logged from
+        # `self.window_episode_stats`.
+        self._single_proc_infos: Dict[str, List[float]] = {}
+    
+    def eval(self) -> None:
+        self._add_preemption_signal_handlers()
+        self.ckpt_path = "cpt/habitat_baselines_v2/mp3d-rgbd-best.pth"
+        self.config = habitat.get_config(config_path="./../../../habitat-baselines/habitat_baselines/config/pointnav/ppo_pointnav.yaml")
+        if self.config.habitat_baselines.eval.should_load_ckpt:
+            proposed_index = get_checkpoint_id(
+                self.ckpt_path
+            )
+        else:
+            proposed_index = None
+
+        if proposed_index is not None:
+            ckpt_idx = proposed_index
+        else:
+            ckpt_idx = 0
+
+        ## eval_check
+        if self.config.habitat_baselines.eval.should_load_ckpt:
+            # map_location="cpu" is almost always better than mapping to a CUDA device.
+            ckpt_dict = self.load_checkpoint(
+                self.ckpt_path, map_location="cpu"
+            )
+            step_id = ckpt_dict["extra_state"]["step"]
+            print(f"Loaded checkpoint trained for {step_id} steps")
+        else:
+            ckpt_dict = {"config": None}
+
+        if "config" not in ckpt_dict:
+            ckpt_dict["config"] = None
+
+        config = self._get_resume_state_config_or_new_config(
+            ckpt_dict["config"]
+        )
+
+        #self._init_envs(config, is_eval=True)
+
+        self.point_agent = self._create_agent(None)
+        if (
+            self.point_agent.actor_critic.should_load_agent_state
+            and self.config.habitat_baselines.eval.should_load_ckpt
+        ):
+            self.point_agent.load_state_dict(ckpt_dict)
+
+        step_id = checkpoint_index
+        if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
+            step_id = ckpt_dict["extra_state"]["step"]
+
+        evaluator = hydra.utils.instantiate(config.habitat_baselines.evaluator)
+        assert isinstance(evaluator, Evaluator)
+        evaluator.evaluate_agent(
+            self._agent,
+            self.envs,
+            self.config,
+            checkpoint_index,
+            step_id,
+            writer,
+            self.device,
+            self.obs_transforms,
+            self._env_spec,
+            self._rank0_keys,
+        )
 
     def reconfigure_sim(self) -> None:
         """
@@ -366,77 +552,38 @@ class HabitatSimInteractiveViewer(Application):
             for _i in range(self.num_env):
                 self.tiled_sims.append(habitat_sim.Simulator(self.cfg))
             self.sim = self.tiled_sims[0]
+            
+            #self.eval()
 
             # add the humanoid to the world via the wrapper
             humanoid_name1 = "male_1"
             humanoid_path1 = f"data/humanoids/humanoid_data/{humanoid_name1}/{humanoid_name1}.urdf"
             walk_pose_path1 = f"data/humanoids/humanoid_data/{humanoid_name1}/{humanoid_name1}_motion_data_smplx.pkl"
-            humanoid_name2 = "female_0"
-            humanoid_path2 = f"data/humanoids/humanoid_data/{humanoid_name2}/{humanoid_name2}.urdf"
-            walk_pose_path2 = f"data/humanoids/humanoid_data/{humanoid_name2}/{humanoid_name2}_motion_data_smplx.pkl"
-            humanoid_name3 = "male_0"
-            humanoid_path3 = f"data/humanoids/humanoid_data/{humanoid_name3}/{humanoid_name3}.urdf"
-            walk_pose_path3 = f"data/humanoids/humanoid_data/{humanoid_name3}/{humanoid_name3}_motion_data_smplx.pkl"
-            humanoid_name4 = "female_3"
-            humanoid_path4 = f"data/humanoids/humanoid_data/{humanoid_name4}/{humanoid_name4}.urdf"
-            walk_pose_path4 = f"data/humanoids/humanoid_data/{humanoid_name4}/{humanoid_name4}_motion_data_smplx.pkl"
             
-
             agent_config1 = DictConfig(
                 {
                     "articulated_agent_urdf": humanoid_path1,
                     "motion_data_path": walk_pose_path1,
                 }
             )
-            agent_config2 = DictConfig(
-                {
-                    "articulated_agent_urdf": humanoid_path2,
-                    "motion_data_path": walk_pose_path2,
-                }
-            )
-            agent_config3 = DictConfig(
-                {
-                    "articulated_agent_urdf": humanoid_path3,
-                    "motion_data_path": walk_pose_path3,
-                }
-            )
-            agent_config4 = DictConfig(
-                {
-                    "articulated_agent_urdf": humanoid_path4,
-                    "motion_data_path": walk_pose_path4,
-                }
-            )
 
             self.kin_humanoid1 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="walk_motion")
-            self.kin_humanoid2 = kinematic_humanoid.KinematicHumanoid(agent_config2, self.sim, pose="walk_motion")
-            self.kin_humanoid3 = kinematic_humanoid.KinematicHumanoid(agent_config3, self.sim, pose="stop_pose")
-            self.kin_humanoid4 = kinematic_humanoid.KinematicHumanoid(agent_config4, self.sim, pose="stop_pose")
+            self.is_stop = False
             
             # 2階
             # 動く
             self.kin_humanoid1.reconfigure()
-            self.kin_humanoid1.base_pos = mn.Vector3(7.6, 3.5141459, -3.9) # (7.6, 3.5141459, -3.9) -> (7.6, 3.5141459, 4.0)
-            self.kin_humanoid1.base_rot = -1.57
+            self.kin_humanoid1.base_pos = mn.Vector3(7.9, 3.5141459, -3.9) # (7.6, 3.5141459, -3.9) -> (7.6, 3.5141459, 4.0)
+            #self.kin_humanoid1.base_rot = -math.pi/2
             self.step_z_list1 = np.arange(-3.9, 4.0, 0.02)
             self.z_index1 = 1
             
-            # 動かない
-            self.kin_humanoid3.reconfigure()
-            self.kin_humanoid3.base_pos = mn.Vector3(14.4, 3.5141459, 9.8)
-            self.kin_humanoid3.base_rot = 2.5
+            goal_radius = 0.02
+            self.follower = ShortestPathFollower(
+                self.env.habitat_env.sim, goal_radius, False
+            )
+            print("MAKE FOLLOWER")
             
-            # 1階
-            # 動く
-            self.kin_humanoid2.reconfigure()
-            self.kin_humanoid2.base_pos = mn.Vector3(7.6, 0.11414599, -9.0) # (7.6, 0.11414599, -9.0) -> (7.6, 0.11414599, 7.3)
-            self.kin_humanoid2.base_rot = -1.57
-            self.step_z_list2 = np.arange(-9.0, 7.3, 0.02)
-            self.z_index2 = 1
-            
-            # 動かない
-            self.kin_humanoid4.reconfigure()
-            self.kin_humanoid4.base_pos = mn.Vector3(4.0, 0.11414599, -4.4)
-            self.kin_humanoid4.base_rot = 0.0
             
         else:  # edge case
             for i in range(self.num_env):
@@ -522,18 +669,31 @@ class HabitatSimInteractiveViewer(Application):
             # update location of grabbed object
             self.update_grab_position(self.previous_mouse_point)
             
-        self.kin_humanoid1.base_pos = mn.Vector3(self.kin_humanoid1.base_pos[0], self.kin_humanoid1.base_pos[1], self.step_z_list1[self.z_index1])
-        self.z_index1 += 1
-        self.kin_humanoid2.base_pos = mn.Vector3(self.kin_humanoid2.base_pos[0], self.kin_humanoid2.base_pos[1], self.step_z_list2[self.z_index2])
-        self.z_index2 += 1
-        if self.z_index1 == self.step_z_list1.shape[0]:
-            self.step_z_list1 = self.step_z_list1[::-1]
-            self.z_index1 = 0
-            self.kin_humanoid1.base_rot = -self.kin_humanoid1.base_rot
-        if self.z_index2 == self.step_z_list2.shape[0]:
-            self.step_z_list2 = self.step_z_list2[::-1]
-            self.z_index2 = 0
-            self.kin_humanoid2.base_rot = -self.kin_humanoid2.base_rot
+        if self.is_stop == False:
+            best_action = self.follower.get_next_action(mn.Vector3(14.4, 3.5141459, 9.8))
+            print(best_action)
+            print(f"x={self.kin_humanoid1.base_pos[0]},y={self.kin_humanoid1.base_pos[2]}, z={self.kin_humanoid1.base_pos[1]}")
+            print(f"rotation={self.kin_humanoid1.base_rot}")
+            print("------------------")
+            print(f"agent: x={self.follower.agent.state}")
+            #forward
+            if best_action == 0:
+                new_x = self.kin_humanoid1.base_pos[0] + 0.02*math.sin(self.kin_humanoid1.base_rot+1.57)
+                new_y = self.kin_humanoid1.base_pos[2] + 0.02*math.cos(self.kin_humanoid1.base_rot+1.57)
+                self.kin_humanoid1.base_pos = mn.Vector3(new_x, self.kin_humanoid1.base_pos[1], new_y)
+                
+            #turn-left
+            elif best_action == 1:
+                self.kin_humanoid1.base_rot += math.pi/12
+                
+            #turn-right
+            elif best_action == 2:
+                self.kin_humanoid1.base_rot -= math.pi/12
+            
+            #stop
+            elif best_action == 3:
+                self.is_stop = True
+                print("STOP!!")
             
 
     def invert_gravity(self) -> None:
@@ -1285,4 +1445,16 @@ if __name__ == "__main__":
 
     print(sim_settings)
     # start the application
-    HabitatSimInteractiveViewer(sim_settings).exec()
+    config = make_cfg(sim_settings)
+    print("AAAAAAAAAAAAA")
+    env_config = habitat.get_config(
+        config_path="benchmark/nav/pointnav/pointnav_habitat_test.yaml",
+    )
+    print(env_config)
+    with read_write(env_config):
+        env_config.habitat.dataset.data_path = "data/datasets/pointnav/mp3d/v1/{split}/{split}.json.gz"
+    print(env_config)
+        
+    with SimpleRLEnv(config=env_config) as env:
+        print("YYYYYYYYYYYYYYYYYYYYY")
+        HabitatSimInteractiveViewer(sim_settings, env).exec()

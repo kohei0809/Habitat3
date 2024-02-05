@@ -13,6 +13,9 @@ import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import csv
+import networkx as nx
+
 flags = sys.getdlopenflags()
 sys.setdlopenflags(flags | ctypes.RTLD_GLOBAL)
 
@@ -51,6 +54,8 @@ class HabitatSimInteractiveViewer(Application):
     DISPLAY_FONT_SIZE = 16.0
 
     def __init__(self, sim_settings: Dict[str, Any]) -> None:
+        self.STEP_METER = 0.01
+        
         self.sim_settings: Dict[str:Any] = sim_settings
 
         self.enable_batch_renderer: bool = self.sim_settings["enable_batch_renderer"]
@@ -289,7 +294,7 @@ class HabitatSimInteractiveViewer(Application):
 
         # draw CPU/GPU usage data and other info to the app window
         mn.gl.default_framebuffer.bind()
-        self.draw_text(self.render_camera.specification())
+        #self.draw_text(self.render_camera.specification())
 
         self.swap_buffers()
         Timer.next_frame()
@@ -339,6 +344,80 @@ class HabitatSimInteractiveViewer(Application):
             body_type="cylinder",
         )
         return agent_config
+    
+    def read_adjacency_matrix(self, file_path):
+        adjacency_matrix = {}
+        nodes = []
+        with open(file_path, 'r') as file:
+            reader = csv.reader(file)
+            for row in reader:
+                node_name = row[0]
+                nodes.append(node_name)
+                adjacency_matrix[node_name] = {row[i]: float(row[i+1]) for i in range(1, len(row), 2)}
+                    
+                print(f"{node_name}: {adjacency_matrix[node_name]}")
+        return adjacency_matrix,nodes
+
+    def find_shortest_path(self, adjacency_matrix, start_node, end_node):
+        G = nx.Graph()
+
+        for node, neighbors in adjacency_matrix.items():
+            for neighbor, angle in neighbors.items():
+                G.add_edge(node, neighbor, weight=1)
+                    
+        try:
+            shortest_path = nx.shortest_path(G, source=start_node, target=end_node)
+            shortest_path_cost = nx.shortest_path_length(G, source=start_node, target=end_node)
+            return shortest_path_cost, shortest_path
+        except nx.NetworkXNoPath:
+            return float('inf'), []
+        
+    def read_node_positions(self, file_path):
+        node_positions = {}
+        with open(file_path, 'r') as file:
+            reader = csv.reader(file)
+            for row in reader:
+                node_name, x, z, y, angle = row
+                node_positions[node_name] = {'x': float(x), 'z': float(z), 'y': float(y), 'angle': float(angle)}
+        return node_positions
+
+    def get_query(self, node_positions, shortest_path_nodes, adjacency_matrix):
+        start_node = shortest_path_nodes[0]
+        position = [node_positions[start_node]["x"], node_positions[start_node]["z"], node_positions[start_node]["y"]]
+        print(position)
+        print(node_positions[start_node]["angle"])
+        
+        actions = []
+        values = []
+        _values = []
+        
+        for i in range(len(shortest_path_nodes)):
+            node = shortest_path_nodes[i]
+            if node == shortest_path_nodes[-1]:
+                actions.append("turn")
+                values.append(node_positions[node]["angle"])
+                _values.append(node_positions[node]["angle"])
+                actions.append("stop")
+                break
+            next_node = shortest_path_nodes[i+1]
+            position = [node_positions[node]["x"], node_positions[node]["z"], node_positions[node]["y"]]
+            if adjacency_matrix[node][next_node] != -1:
+                actions.append("turn")
+                values.append(adjacency_matrix[node][next_node])
+                _values.append(adjacency_matrix[node][next_node])
+                
+            if (node_positions[node]["x"] != node_positions[next_node]["x"]) and (node_positions[node]["y"] != node_positions[next_node]["y"]):
+                actions.append("warp")
+            else:
+                actions.append("change_goal")
+                actions.append("go")
+                
+            values.append(mn.Vector3(node_positions[next_node]["x"], node_positions[next_node]["z"], node_positions[next_node]["y"]))
+            _values.append([node_positions[next_node]["x"], node_positions[next_node]["z"], node_positions[next_node]["y"]])
+            
+        print(actions)
+        print(_values)
+        return actions, values
 
     def reconfigure_sim(self) -> None:
         """
@@ -366,77 +445,147 @@ class HabitatSimInteractiveViewer(Application):
             for _i in range(self.num_env):
                 self.tiled_sims.append(habitat_sim.Simulator(self.cfg))
             self.sim = self.tiled_sims[0]
+            
+            self.humanoid_num = 0
+            self.kin_humanoid_list = []
+            self.is_stop_list = []
+            self.actions_list = []
+            self.values_list = []
+            self._index_list = []
+            self.action_index_list = []
+            self.value_index_list = []
+            self.step_list_list = []
+            self.is_x_list = []
 
             # add the humanoid to the world via the wrapper
-            humanoid_name1 = "male_1"
+            humanoid_name = "male_1"
+            humanoid_path = f"data/humanoids/humanoid_data/{humanoid_name}/{humanoid_name}.urdf"
+            walk_pose_path = f"data/humanoids/humanoid_data/{humanoid_name}/{humanoid_name}_motion_data_smplx.pkl"
+
+            agent_config = DictConfig(
+                {
+                    "articulated_agent_urdf": humanoid_path,
+                    "motion_data_path": walk_pose_path,
+                }
+            )
+            
+            link_file_path = "data/scene_datasets/mp3d/2azQ1b91cZZ/2azQ1b91cZZ_link.csv"
+            position_file_path = "data/scene_datasets/mp3d/2azQ1b91cZZ/2azQ1b91cZZ_position.csv"
+            
+            kin_humanoid = kinematic_humanoid.KinematicHumanoid(agent_config, self.sim, pose="walk_motion")
+            kin_humanoid.reconfigure()
+            start_node = "0_wait_3"
+            end_node = "4_wait_4"
+
+            adjacency_matrix, nodes = self.read_adjacency_matrix(link_file_path)
+
+            if start_node not in nodes or end_node not in nodes:
+                print("Invalid node names.")
+            shortest_path_cost, shortest_path_nodes = self.find_shortest_path(adjacency_matrix, start_node, end_node)
+            if shortest_path_cost == float('inf'):
+                print("No path found.")
+            
+            print(f"The shortest path from {start_node} to {end_node} is: {shortest_path_nodes}")
+            print(f"The cost of the shortest path is: {shortest_path_cost}")
+            
+            node_positions = self.read_node_positions(position_file_path)
+            actions, values = self.get_query(node_positions, shortest_path_nodes, adjacency_matrix)
+            kin_humanoid.base_pos = mn.Vector3(node_positions[start_node]["x"], node_positions[start_node]["z"], node_positions[start_node]["y"])
+            kin_humanoid.base_rot = node_positions[start_node]["angle"]
+            """
+            kin_humanoid.base_pos = mn.Vector3(16.5, 0, 10)
+            kin_humanoid.base_rot = 1.57
+            actions = ["change_goal", "go", "turn", "change_goal", "go", "turn", "change_goal", "go", "turn", "change_goal", "go", "turn", "change_goal", "go", "warp", "turn", "stop"]
+            values = [mn.Vector3(16.5, 0, 3.4), 3.14, mn.Vector3(13, 0, 3.4), 1.57, mn.Vector3(13, 0, 1), 3.14, mn.Vector3(2.7, 0, 1), -1.57, mn.Vector3(2.7, 0, 7), mn.Vector3(3.1, 0, 8.5), 3.14]
+            """
+            
+            self.humanoid_num += 1
+            self.kin_humanoid_list.append(kin_humanoid)
+            self.is_stop_list.append(False)
+            self.actions_list.append(actions)
+            self.values_list.append(values)
+            self._index_list.append(0)
+            self.action_index_list.append(0)
+            self.value_index_list.append(0)
+            self.step_list_list.append([])
+            self.is_x_list.append(True)
+            
+            
+            # 動かない
+            humanoid_name1 = "male_0"
             humanoid_path1 = f"data/humanoids/humanoid_data/{humanoid_name1}/{humanoid_name1}.urdf"
-            walk_pose_path1 = f"data/humanoids/humanoid_data/{humanoid_name1}/{humanoid_name1}_motion_data_smplx.pkl"
+            motion_path1 = f"data/humanoids/humanoid_data/{humanoid_name1}/{humanoid_name1}_motion_data_smplx.pkl"
             humanoid_name2 = "female_0"
             humanoid_path2 = f"data/humanoids/humanoid_data/{humanoid_name2}/{humanoid_name2}.urdf"
-            walk_pose_path2 = f"data/humanoids/humanoid_data/{humanoid_name2}/{humanoid_name2}_motion_data_smplx.pkl"
-            humanoid_name3 = "male_0"
+            motion_path2 = f"data/humanoids/humanoid_data/{humanoid_name2}/{humanoid_name2}_motion_data_smplx.pkl"
+            humanoid_name3 = "female_1"
             humanoid_path3 = f"data/humanoids/humanoid_data/{humanoid_name3}/{humanoid_name3}.urdf"
-            walk_pose_path3 = f"data/humanoids/humanoid_data/{humanoid_name3}/{humanoid_name3}_motion_data_smplx.pkl"
-            humanoid_name4 = "female_3"
-            humanoid_path4 = f"data/humanoids/humanoid_data/{humanoid_name4}/{humanoid_name4}.urdf"
-            walk_pose_path4 = f"data/humanoids/humanoid_data/{humanoid_name4}/{humanoid_name4}_motion_data_smplx.pkl"
-            
-
+            motion_path3 = f"data/humanoids/humanoid_data/{humanoid_name3}/{humanoid_name3}_motion_data_smplx.pkl"
             agent_config1 = DictConfig(
                 {
                     "articulated_agent_urdf": humanoid_path1,
-                    "motion_data_path": walk_pose_path1,
+                    "motion_data_path": motion_path1,
                 }
             )
             agent_config2 = DictConfig(
                 {
                     "articulated_agent_urdf": humanoid_path2,
-                    "motion_data_path": walk_pose_path2,
+                    "motion_data_path": motion_path2,
                 }
             )
             agent_config3 = DictConfig(
                 {
                     "articulated_agent_urdf": humanoid_path3,
-                    "motion_data_path": walk_pose_path3,
+                    "motion_data_path": motion_path3,
                 }
             )
-            agent_config4 = DictConfig(
-                {
-                    "articulated_agent_urdf": humanoid_path4,
-                    "motion_data_path": walk_pose_path4,
-                }
-            )
-
-            self.kin_humanoid1 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="walk_motion")
-            self.kin_humanoid2 = kinematic_humanoid.KinematicHumanoid(agent_config2, self.sim, pose="walk_motion")
-            self.kin_humanoid3 = kinematic_humanoid.KinematicHumanoid(agent_config3, self.sim, pose="stop_pose")
-            self.kin_humanoid4 = kinematic_humanoid.KinematicHumanoid(agent_config4, self.sim, pose="stop_pose")
             
-            # 2階
-            # 動く
-            self.kin_humanoid1.reconfigure()
-            self.kin_humanoid1.base_pos = mn.Vector3(7.6, 3.5141459, -3.9) # (7.6, 3.5141459, -3.9) -> (7.6, 3.5141459, 4.0)
-            self.kin_humanoid1.base_rot = -1.57
-            self.step_z_list1 = np.arange(-3.9, 4.0, 0.02)
-            self.z_index1 = 1
+            kin_humanoid1 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid1.reconfigure()
+            kin_humanoid1.base_pos = mn.Vector3(2, 0, 7.3)
+            kin_humanoid1.base_rot = -1.57
             
-            # 動かない
-            self.kin_humanoid3.reconfigure()
-            self.kin_humanoid3.base_pos = mn.Vector3(14.4, 3.5141459, 9.8)
-            self.kin_humanoid3.base_rot = 2.5
+            kin_humanoid2 = kinematic_humanoid.KinematicHumanoid(agent_config2, self.sim, pose="stop_pose")
+            kin_humanoid2.reconfigure()
+            kin_humanoid2.base_pos = mn.Vector3(1, 0, 8.5)
+            kin_humanoid2.base_rot = 0
             
-            # 1階
-            # 動く
-            self.kin_humanoid2.reconfigure()
-            self.kin_humanoid2.base_pos = mn.Vector3(7.6, 0.11414599, -9.0) # (7.6, 0.11414599, -9.0) -> (7.6, 0.11414599, 7.3)
-            self.kin_humanoid2.base_rot = -1.57
-            self.step_z_list2 = np.arange(-9.0, 7.3, 0.02)
-            self.z_index2 = 1
+            kin_humanoid3 = kinematic_humanoid.KinematicHumanoid(agent_config3, self.sim, pose="stop_pose")
+            kin_humanoid3.reconfigure()
+            kin_humanoid3.base_pos = mn.Vector3(2, 0, 9.6)
+            kin_humanoid3.base_rot = 1.57
             
-            # 動かない
-            self.kin_humanoid4.reconfigure()
-            self.kin_humanoid4.base_pos = mn.Vector3(4.0, 0.11414599, -4.4)
-            self.kin_humanoid4.base_rot = 0.0
+            """
+            kin_humanoid4 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid4.reconfigure()
+            kin_humanoid4.base_pos = mn.Vector3(-7.5, 0.9, -12.4)
+            kin_humanoid4.base_rot = 0
+            
+            kin_humanoid5 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid5.reconfigure()
+            kin_humanoid5.base_pos = mn.Vector3(-7.5, 0.9, -11.6)
+            kin_humanoid5.base_rot = 0
+            
+            kin_humanoid6 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid6.reconfigure()
+            kin_humanoid6.base_pos = mn.Vector3(-7.5, 0.9, -10.9)
+            kin_humanoid6.base_rot = 0
+            
+            kin_humanoid7 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid7.reconfigure()
+            kin_humanoid7.base_pos = mn.Vector3(-3.6, 0, -7)
+            kin_humanoid7.base_rot = 1.57
+            
+            kin_humanoid8 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid8.reconfigure()
+            kin_humanoid8.base_pos = mn.Vector3(-3.6, 0, -11)
+            kin_humanoid8.base_rot = 1.57
+            
+            kin_humanoid9 = kinematic_humanoid.KinematicHumanoid(agent_config1, self.sim, pose="stop_pose")
+            kin_humanoid9.reconfigure()
+            kin_humanoid9.base_pos = mn.Vector3(-5.3, 0.5, -13)
+            kin_humanoid9.base_rot = 0
+            """
             
         else:  # edge case
             for i in range(self.num_env):
@@ -522,19 +671,82 @@ class HabitatSimInteractiveViewer(Application):
             # update location of grabbed object
             self.update_grab_position(self.previous_mouse_point)
             
-        self.kin_humanoid1.base_pos = mn.Vector3(self.kin_humanoid1.base_pos[0], self.kin_humanoid1.base_pos[1], self.step_z_list1[self.z_index1])
-        self.z_index1 += 1
-        self.kin_humanoid2.base_pos = mn.Vector3(self.kin_humanoid2.base_pos[0], self.kin_humanoid2.base_pos[1], self.step_z_list2[self.z_index2])
-        self.z_index2 += 1
-        if self.z_index1 == self.step_z_list1.shape[0]:
-            self.step_z_list1 = self.step_z_list1[::-1]
-            self.z_index1 = 0
-            self.kin_humanoid1.base_rot = -self.kin_humanoid1.base_rot
-        if self.z_index2 == self.step_z_list2.shape[0]:
-            self.step_z_list2 = self.step_z_list2[::-1]
-            self.z_index2 = 0
-            self.kin_humanoid2.base_rot = -self.kin_humanoid2.base_rot
+        for i in range(self.humanoid_num):
+            is_stop = self.is_stop_list[i]
+            if is_stop is True:
+                continue
+                
+            kin_humanoid = self.kin_humanoid_list[i]
+            _index = self._index_list[i]
+            step_list = self.step_list_list[i]
+            actions = self.actions_list[i]
+            values = self.values_list[i]
+            action_index = self.action_index_list[i]
+            value_index = self.value_index_list[i]
+            #print(f"i={i}, action={actions[action_index]}")
+            #print(f"action_index={action_index}, value_index={value_index}")
+            if actions[action_index] == "go":
+                if self.is_x_list[i] == True:
+                    kin_humanoid.base_pos = mn.Vector3(step_list[_index], kin_humanoid.base_pos[1], kin_humanoid.base_pos[2])
+                else:
+                    kin_humanoid.base_pos = mn.Vector3(kin_humanoid.base_pos[0], kin_humanoid.base_pos[1], step_list[_index])
+                _index += 1
+                
+                if _index == step_list.shape[0]:
+                    print(f"i={i}, action={actions[action_index]}")
+                    print(f"action_index={action_index}, value_index={value_index}")
+                    action_index += 1
+                    value_index += 1
+            elif actions[action_index] == "warp":
+                kin_humanoid.base_pos = mn.Vector3(values[value_index][0], values[value_index][1], values[value_index][2])
+                print(f"i={i}, action={actions[action_index]}")
+                print(f"action_index={action_index}, value_index={value_index}")
+                action_index += 1
+                value_index += 1
+            elif actions[action_index] == "turn":
+                kin_humanoid.base_rot = values[value_index]
+                print(f"i={i}, action={actions[action_index]}")
+                print(f"action_index={action_index}, value_index={value_index}")
+                print(f"pos ({kin_humanoid.base_pos[0]}, {kin_humanoid.base_pos[1]}, {kin_humanoid.base_pos[2]})")
+                
+                action_index += 1
+                value_index += 1
+            elif actions[action_index] == "stop":
+                print(f"i={i}, stop!!!")
+                is_stop = True
+                kin_humanoid.change_pose("stop_pose")
+                kin_humanoid.reconfigure()
+                self.is_stop_list[i] = is_stop
+            elif actions[action_index] == "change_goal":
+                print(f"i={i}, action={actions[action_index]}")
+                print(f"action_index={action_index}, value_index={value_index}")
+                print(f"from ({kin_humanoid.base_pos[0]}, {kin_humanoid.base_pos[1]}, {kin_humanoid.base_pos[2]}) to ({values[value_index][0]}, {values[value_index][1]}, {values[value_index][2]})")
+                _index = 0
+                
+                step_size = self.STEP_METER
+                diff_x = math.fabs(kin_humanoid.base_pos[0]-values[value_index][0])
+                diff_z = math.fabs(kin_humanoid.base_pos[2]-values[value_index][2])
+                if diff_x < diff_z:
+                    print("change_goal: 0")
+                    if kin_humanoid.base_pos[2] > values[value_index][2]:
+                        step_size = -self.STEP_METER
+                    step_list = np.arange(kin_humanoid.base_pos[2], values[value_index][2], step_size)
+                    self.is_x_list[i] = False
+                else: 
+                    print("change_goal: 2")
+                    if kin_humanoid.base_pos[0] > values[value_index][0]:
+                        step_size = -self.STEP_METER
+                    step_list = np.arange(kin_humanoid.base_pos[0], values[value_index][0], step_size)
+                    self.is_x_list[i] = True
+
+                action_index += 1
             
+            self.kin_humanoid_list[i] = kin_humanoid
+            self._index_list[i] = _index
+            self.step_list_list[i] = step_list
+            self.action_index_list[i] = action_index
+            self.value_index_list[i] = value_index
+                
 
     def invert_gravity(self) -> None:
         """

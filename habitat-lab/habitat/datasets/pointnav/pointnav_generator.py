@@ -16,6 +16,7 @@ import numpy as np
 from habitat.core.simulator import ShortestPathPoint
 from habitat.datasets.utils import get_action_shortest_path
 from habitat.tasks.nav.nav import NavigationEpisode, NavigationGoal
+from habitat.core.logging import logger
 
 try:
     from habitat_sim.errors import GreedyFollowerError
@@ -90,6 +91,17 @@ def _create_episode(
         shortest_paths=shortest_paths,
         info=info,
     )
+    
+def _create_episode2(episode_id, scene_id, start_position, start_rotation,) -> Optional[NavigationEpisode]:
+    return NavigationEpisode(
+        episode_id=str(episode_id),
+        goals=goals,
+        scene_id=scene_id,
+        start_position=start_position,
+        start_rotation=start_rotation,
+        shortest_paths=shortest_paths,
+        info=info,
+    )
 
 
 def generate_pointnav_episode(
@@ -136,6 +148,8 @@ def generate_pointnav_episode(
     """
     episode_count = 0
     while episode_count < num_episodes or num_episodes < 0:
+        if episode_count % 100000 == 0:
+            logger.info(episode_count)
         target_position = sim.sample_navigable_point()
 
         if sim.island_radius(target_position) < ISLAND_RADIUS_LIMIT:
@@ -188,3 +202,23 @@ def generate_pointnav_episode(
 
             episode_count += 1
             yield episode
+
+
+def generate_pointnav_episode2(sim: "HabitatSim",num_episodes: int = -1,) -> Generator[NavigationEpisode, None, None]:
+    episode_count = 0
+    while episode_count < num_episodes or num_episodes < 0:
+        if episode_count % 100000 == 0:
+            logger.info(episode_count)
+        source_position = sim.sample_navigable_point()
+        angle = np.random.uniform(0, 2 * np.pi)
+        source_rotation = [0, np.sin(angle / 2), 0, np.cos(angle / 2)]
+
+        episode = _create_episode2(
+            episode_id=episode_count,
+            scene_id=sim.config.SCENE,
+            start_position=source_position,
+            start_rotation=source_rotation,
+        )
+
+        episode_count += 1
+        yield episode

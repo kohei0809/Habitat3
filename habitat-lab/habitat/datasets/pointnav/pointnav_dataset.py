@@ -111,7 +111,9 @@ class PointNavDatasetV1(Dataset):
         if config is None:
             return
 
-        datasetfile_path = config.data_path.format(split=config.split)
+        #datasetfile_path = config.data_path.format(split=config.split)
+        datasetfile_path = config["data_path"].format(split=config["split"])
+
 
         self._load_from_file(datasetfile_path, config.scenes_dir)
 
