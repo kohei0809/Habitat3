@@ -22,7 +22,7 @@ from utils.log_manager import LogManager
 from utils.log_writer import LogWriter
 from habitat.core.logging import logger        
        
-def research_valid_z(scene_idx):
+def research_valid_z():
     exp_config = "./habitat_baselines/config/maximuminfo/ppo_maximuminfo.yaml"
     opts = None
     config = get_config(exp_config, opts)
@@ -90,6 +90,6 @@ def research_valid_z(scene_idx):
              
                 
 if __name__ == '__main__':
-    research_valid_z(scene_idx)
+    research_valid_z()
     
     logger.info("################# FINISH EXPERIMENT !!!!! ##########################")
