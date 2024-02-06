@@ -700,7 +700,7 @@ def is_continuous_action_space(action_space) -> bool:
         )
 
 
-def get_action_space_info(ac_space: spaces.Space) -> Tuple[Tuple[int], bool]:
+def get_action_space_info(ac_space) -> Tuple[Tuple[int], bool]:
     """
     :returns: The shape of the action space and if the action space is discrete. If the action space is discrete, the shape will be `(1,)`.
     """

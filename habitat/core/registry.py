@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright (c) Meta Platforms, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -25,32 +25,19 @@ Various decorators for registry different kind of classes with unique keys
 -   Register a sensor: ``@registry.register_sensor``
 -   Register a measure: ``@registry.register_measure``
 -   Register a dataset: ``@registry.register_dataset``
--   Register a environment: ``@registry.register_env``
 """
 
 import collections
-from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Optional, Type
+from typing import Optional
 
-from habitat.core.dataset import Dataset
-from habitat.core.embodied_task import Action, EmbodiedTask, Measure
-from habitat.core.simulator import Sensor, Simulator
 from habitat.core.utils import Singleton
-
-if TYPE_CHECKING:
-    from habitat.core.env import RLEnv
 
 
 class Registry(metaclass=Singleton):
-    mapping: DefaultDict[str, Any] = collections.defaultdict(dict)
+    mapping = collections.defaultdict(dict)
 
     @classmethod
-    def _register_impl(
-        cls,
-        _type: str,
-        to_register: Optional[Any],
-        name: Optional[str],
-        assert_type: Optional[Type] = None,
-    ) -> Callable:
+    def _register_impl(cls, _type, to_register, name, assert_type=None):
         def wrap(to_register):
             if assert_type is not None:
                 assert issubclass(
@@ -92,6 +79,7 @@ class Registry(metaclass=Singleton):
                 pass
 
         """
+        from habitat.core.embodied_task import EmbodiedTask
 
         return cls._register_impl(
             "task", to_register, name, assert_type=EmbodiedTask
@@ -99,7 +87,7 @@ class Registry(metaclass=Singleton):
 
     @classmethod
     def register_simulator(
-        cls, to_register: None = None, *, name: Optional[str] = None
+        cls, to_register=None, *, name: Optional[str] = None
     ):
         r"""Register a simulator to registry with key :p:`name`
 
@@ -123,6 +111,7 @@ class Registry(metaclass=Singleton):
                 pass
 
         """
+        from habitat.core.simulator import Simulator
 
         return cls._register_impl(
             "sim", to_register, name, assert_type=Simulator
@@ -135,6 +124,7 @@ class Registry(metaclass=Singleton):
         :param name: Key with which the sensor will be registered.
             If :py:`None` will use the name of the class
         """
+        from habitat.core.simulator import Sensor
 
         return cls._register_impl(
             "sensor", to_register, name, assert_type=Sensor
@@ -147,6 +137,7 @@ class Registry(metaclass=Singleton):
         :param name: Key with which the measure will be registered.
             If :py:`None` will use the name of the class
         """
+        from habitat.core.embodied_task import Measure
 
         return cls._register_impl(
             "measure", to_register, name, assert_type=Measure
@@ -164,6 +155,7 @@ class Registry(metaclass=Singleton):
         :param name: Key with which the task action will be registered. If
             :py:`None` will use the name of the task action's method.
         """
+        from habitat.core.embodied_task import Action
 
         return cls._register_impl(
             "task_action", to_register, name, assert_type=Action
@@ -176,56 +168,61 @@ class Registry(metaclass=Singleton):
         :param name: Key with which the dataset will be registered.
             If :py:`None` will use the name of the class
         """
+        from habitat.core.dataset import Dataset
 
         return cls._register_impl(
             "dataset", to_register, name, assert_type=Dataset
         )
 
     @classmethod
-    def register_env(cls, to_register=None, *, name: Optional[str] = None):
-        r"""Register a environment to registry with key 'name'
-            currently only support subclass of RLEnv.
+    def register_action_space_configuration(
+        cls, to_register=None, *, name: Optional[str] = None
+    ):
+        r"""Register a action space configuration to registry with key :p:`name`
 
-        Args:
-            name: Key with which the env will be registered.
-                If None will use the name of the class.
-
+        :param name: Key with which the action space will be registered.
+            If :py:`None` will use the name of the class
         """
-        from gym import Env
+        from habitat.core.simulator import ActionSpaceConfiguration
 
-        return cls._register_impl("env", to_register, name, assert_type=Env)
+        return cls._register_impl(
+            "action_space_config",
+            to_register,
+            name,
+            assert_type=ActionSpaceConfiguration,
+        )
 
     @classmethod
-    def _get_impl(cls, _type: str, name: str) -> Type:
+    def _get_impl(cls, _type, name):
         return cls.mapping[_type].get(name, None)
 
     @classmethod
-    def get_task(cls, name: str) -> Type[EmbodiedTask]:
+    def get_task(cls, name):
         return cls._get_impl("task", name)
 
     @classmethod
-    def get_task_action(cls, name: str) -> Type[Action]:
+    def get_task_action(cls, name):
         return cls._get_impl("task_action", name)
 
     @classmethod
-    def get_simulator(cls, name: str) -> Type[Simulator]:
+    def get_simulator(cls, name):
         return cls._get_impl("sim", name)
 
     @classmethod
-    def get_sensor(cls, name: str) -> Type[Sensor]:
+    def get_sensor(cls, name):
         return cls._get_impl("sensor", name)
 
     @classmethod
-    def get_measure(cls, name: str) -> Type[Measure]:
+    def get_measure(cls, name):
         return cls._get_impl("measure", name)
 
     @classmethod
-    def get_dataset(cls, name: str) -> Type[Dataset]:
+    def get_dataset(cls, name):
         return cls._get_impl("dataset", name)
 
     @classmethod
-    def get_env(cls, name: str) -> Type["RLEnv"]:
-        return cls._get_impl("env", name)
+    def get_action_space_configuration(cls, name):
+        return cls._get_impl("action_space_config", name)
 
 
 registry = Registry()

@@ -1,298 +1,230 @@
 #!/usr/bin/env python3
 
-# Copyright (c) Meta Platforms, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
+import json
 import os
-import random
 import time
+import pathlib
+import sys
 from collections import defaultdict, deque
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-import hydra
+from einops import rearrange
+from matplotlib import pyplot as plt
+import math
 import numpy as np
 import torch
-from omegaconf import OmegaConf
+import torch.nn.functional as F
+import torch_scatter
+import tqdm
+from torch.optim.lr_scheduler import LambdaLR
 
-import habitat_baselines.rl.multi_agent  # noqa: F401.
-from habitat import VectorEnv, logger
-from habitat.config import read_write
-from habitat.config.default import get_agent_config
-from habitat.utils import profiling_wrapper
-from habitat_baselines.common import VectorEnvFactory
-from habitat_baselines.common.base_trainer import BaseRLTrainer
+from habitat import Config
+from habitat.core.logging import logger
+from habitat.utils.visualizations.utils import observations_to_image
+from habitat_baselines.common.base_trainer import BaseRLTrainerOracle
 from habitat_baselines.common.baseline_registry import baseline_registry
-from habitat_baselines.common.env_spec import EnvironmentSpec
-from habitat_baselines.common.obs_transformers import (
-    apply_obs_transforms_batch,
-    apply_obs_transforms_obs_space,
-    get_active_obs_transforms,
-)
-from habitat_baselines.common.tensorboard_utils import (
-    TensorboardWriter,
-    get_writer,
-)
-from habitat_baselines.rl.ddppo.algo import DDPPO  # noqa: F401.
-from habitat_baselines.rl.ddppo.ddp_utils import (
-    EXIT,
-    get_distrib_size,
-    init_distrib_slurm,
-    is_slurm_batch_job,
-    load_resume_state,
-    rank0_only,
-    requeue_job,
-    save_resume_state,
-)
-
-if TYPE_CHECKING:
-    from omegaconf import DictConfig
-
-from habitat_baselines.rl.ddppo.policy import PointNavResNetNet
-from habitat_baselines.rl.ppo.agent_access_mgr import AgentAccessMgr
-from habitat_baselines.rl.ppo.evaluator import Evaluator
-from habitat_baselines.rl.ppo.single_agent_access_mgr import (  # noqa: F401.
-    SingleAgentAccessMgr,
-)
-from habitat_baselines.utils.common import (
+from habitat_baselines.common.env_utils import construct_envs
+from habitat_baselines.common.environments import get_env_class
+from habitat_baselines.common.rollout_storage import RolloutStorageOracle
+from habitat_baselines.common.tensorboard_utils import TensorboardWriter
+from habitat_baselines.common.utils import (
     batch_obs,
-    inference_mode,
-    is_continuous_action_space,
+    generate_video,
+    linear_decay,
 )
-from habitat_baselines.utils.info_dict import (
-    NON_SCALAR_METRICS,
-    extract_scalars_from_infos,
-)
-from habitat_baselines.utils.timing import g_timer
+from habitat_baselines.rl.ppo import PPOOracle, BaselinePolicyOracle, ProposedPolicyOracle
+from utils.log_manager import LogManager
+from utils.log_writer import LogWriter
+from habitat.utils.visualizations import fog_of_war, maps
 
 
-@baseline_registry.register_trainer(name="ddppo")
-@baseline_registry.register_trainer(name="ppo")
-class PPOTrainer(BaseRLTrainer):
+def to_grid(coordinate_min, coordinate_max, global_map_size, position):
+    grid_size = (coordinate_max - coordinate_min) / global_map_size
+    grid_x = ((coordinate_max - position[0]) / grid_size).round()
+    grid_y = ((position[1] - coordinate_min) / grid_size).round()
+    return int(grid_x), int(grid_y)
+
+
+def draw_projection(image, depth, s, global_map_size, coordinate_min, coordinate_max):
+    image = torch.tensor(image).permute(2, 0, 1).unsqueeze(0)
+    depth = torch.tensor(depth).permute(2, 0, 1).unsqueeze(0)
+    spatial_locs, valid_inputs = _compute_spatial_locs(depth, s, global_map_size, coordinate_min, coordinate_max)
+    x_gp1 = _project_to_ground_plane(image, spatial_locs, valid_inputs, s)
+    
+    return x_gp1
+
+
+def _project_to_ground_plane(img_feats, spatial_locs, valid_inputs, s):
+    outh, outw = (s, s)
+    bs, f, HbyK, WbyK = img_feats.shape
+    device = img_feats.device
+    eps=-1e16
+    K = 1
+
+    # Sub-sample spatial_locs, valid_inputs according to img_feats resolution.
+    idxes_ss = ((torch.arange(0, HbyK, 1)*K).long().to(device), \
+                (torch.arange(0, WbyK, 1)*K).long().to(device))
+
+    spatial_locs_ss = spatial_locs[:, :, idxes_ss[0][:, None], idxes_ss[1]] # (bs, 2, HbyK, WbyK)
+    valid_inputs_ss = valid_inputs[:, :, idxes_ss[0][:, None], idxes_ss[1]] # (bs, 1, HbyK, WbyK)
+    valid_inputs_ss = valid_inputs_ss.squeeze(1) # (bs, HbyK, WbyK)
+    invalid_inputs_ss = ~valid_inputs_ss
+
+    # Filter out invalid spatial locations
+    invalid_spatial_locs = (spatial_locs_ss[:, 1] >= outh) | (spatial_locs_ss[:, 1] < 0 ) | \
+                        (spatial_locs_ss[:, 0] >= outw) | (spatial_locs_ss[:, 0] < 0 ) # (bs, H, W)
+
+    invalid_writes = invalid_spatial_locs | invalid_inputs_ss
+
+    # Set the idxes for all invalid locations to (0, 0)
+    spatial_locs_ss[:, 0][invalid_writes] = 0
+    spatial_locs_ss[:, 1][invalid_writes] = 0
+
+    # Weird hack to account for max-pooling negative feature values
+    invalid_writes_f = rearrange(invalid_writes, 'b h w -> b () h w').float()
+    img_feats_masked = img_feats * (1 - invalid_writes_f) + eps * invalid_writes_f
+    img_feats_masked = rearrange(img_feats_masked, 'b e h w -> b e (h w)')
+
+    # Linearize ground-plane indices (linear idx = y * W + x)
+    linear_locs_ss = spatial_locs_ss[:, 1] * outw + spatial_locs_ss[:, 0] # (bs, H, W)
+    linear_locs_ss = rearrange(linear_locs_ss, 'b h w -> b () (h w)')
+    linear_locs_ss = linear_locs_ss.expand(-1, f, -1) # .contiguous()
+
+    proj_feats, _ = torch_scatter.scatter_max(
+                        img_feats_masked,
+                        linear_locs_ss,
+                        dim=2,
+                        dim_size=outh*outw,
+                    )
+    proj_feats = rearrange(proj_feats, 'b e (h w) -> b e h w', h=outh)
+
+    # Replace invalid features with zeros
+    eps_mask = (proj_feats == eps).float()
+    proj_feats = proj_feats * (1 - eps_mask) + eps_mask * (proj_feats - eps)
+
+    return proj_feats
+
+
+def _compute_spatial_locs(depth_inputs, s, global_map_size, coordinate_min, coordinate_max):
+    bs, _, imh, imw = depth_inputs.shape
+    local_scale = float(coordinate_max - coordinate_min)/float(global_map_size)
+    cx, cy = 256./2., 256./2.
+    fx = fy =  (256. / 2.) / np.tan(np.deg2rad(79. / 2.))
+
+    #2D image coordinates
+    x    = rearrange(torch.arange(0, imw), 'w -> () () () w')
+    y    = rearrange(torch.arange(imh, 0, step=-1), 'h -> () () h ()')
+    xx   = (x - cx) / fx
+    yy   = (y - cy) / fy
+
+    # 3D real-world coordinates (in meters)
+    Z            = depth_inputs
+    X            = xx * Z
+    Y            = yy * Z
+    # valid_inputs = (depth_inputs != 0) & ((Y < 1) & (Y > -1))
+    valid_inputs = (depth_inputs != 0) & ((Y > -0.5) & (Y < 1))
+
+    # 2D ground projection coordinates (in meters)
+    # Note: map_scale - dimension of each grid in meters
+    # - depth/scale + (s-1)/2 since image convention is image y downward
+    # and agent is facing upwards.
+    x_gp            = ( (X / local_scale) + (s-1)/2).round().long() # (bs, 1, imh, imw)
+    y_gp            = (-(Z / local_scale) + (s-1)/2).round().long() # (bs, 1, imh, imw)
+
+    return torch.cat([x_gp, y_gp], dim=1), valid_inputs
+
+
+def rotate_tensor(x_gp, heading):
+    sin_t = torch.sin(heading.squeeze(1))
+    cos_t = torch.cos(heading.squeeze(1))
+    A = torch.zeros(x_gp.size(0), 2, 3)
+    A[:, 0, 0] = cos_t
+    A[:, 0, 1] = sin_t
+    A[:, 1, 0] = -sin_t
+    A[:, 1, 1] = cos_t
+
+    grid = F.affine_grid(A, x_gp.size())
+    rotated_x_gp = F.grid_sample(x_gp, grid)
+    return rotated_x_gp
+
+
+# ciの閾値が単体
+@baseline_registry.register_trainer(name="oracle")
+class PPOTrainerO(BaseRLTrainerOracle):
     r"""Trainer class for PPO algorithm
     Paper: https://arxiv.org/abs/1707.06347.
     """
     supported_tasks = ["Nav-v0"]
 
-    SHORT_ROLLOUT_THRESHOLD: float = 0.25
-    _is_distributed: bool
-    envs: VectorEnv
-    _env_spec: Optional[EnvironmentSpec]
-
     def __init__(self, config=None):
         super().__init__(config)
-
-        self._agent = None
+        self.actor_critic = None
+        self.agent = None
         self.envs = None
-        self.obs_transforms = []
-        self._is_static_encoder = False
+        if config is not None:
+            logger.info(f"config: {config}")
+
+        self._static_encoder = False
         self._encoder = None
-        self._env_spec = None
+        
+        self._num_picture = config.TASK_CONFIG.TASK.PICTURE.NUM_PICTURE
+        #撮った写真のRGB画像を保存
+        #self._taken_picture = []
+        #撮った写真のciと位置情報、向きを保存
+        self._taken_picture_list = []
+        
+        # 1回のCIを保存
+        self._observed_object_ci_one = []
+        self._target_index_list = []
+        self._taken_index_list = []
+        
+        # 1回のCIの閾値
+        self.TARGET_THRESHOLD_ONE = 20
 
-        # Distributed if the world size would be
-        # greater than 1
-        self._is_distributed = get_distrib_size()[2] > 1
 
-    def _all_reduce(self, t: torch.Tensor) -> torch.Tensor:
-        r"""All reduce helper method that moves things to the correct
-        device and only runs if distributed
+    def _setup_actor_critic_agent(self, ppo_cfg: Config) -> None:
+        r"""Sets up actor critic and agent for PPO.
+
+        Args:
+            ppo_cfg: config node with relevant params
+
+        Returns:
+            None
         """
-        if not self._is_distributed:
-            return t
+        logger.add_filehandler(self.config.LOG_FILE)
 
-        orig_device = t.device
-        t = t.to(device=self.device)
-        torch.distributed.all_reduce(t)
-
-        return t.to(device=orig_device)
-
-    def _create_obs_transforms(self):
-        self.obs_transforms = get_active_obs_transforms(self.config)
-        self._env_spec.observation_space = apply_obs_transforms_obs_space(
-            self._env_spec.observation_space, self.obs_transforms
-        )
-
-    def _create_agent(self, resume_state, **kwargs) -> AgentAccessMgr:
-        """
-        Sets up the AgentAccessMgr. You still must call `agent.post_init` after
-        this call. This only constructs the object.
-        """
-
-        self._create_obs_transforms()
-        return baseline_registry.get_agent_access_mgr(
-            self.config.habitat_baselines.rl.agent.type
-        )(
-            config=self.config,
-            env_spec=self._env_spec,
-            is_distrib=self._is_distributed,
-            device=self.device,
-            resume_state=resume_state,
-            num_envs=self.envs.num_envs,
-            percent_done_fn=self.percent_done,
-            **kwargs,
-        )
-
-    def _init_envs(self, config=None, is_eval: bool = False):
-        if config is None:
-            config = self.config
-
-        env_factory: VectorEnvFactory = hydra.utils.instantiate(
-            config.habitat_baselines.vector_env_factory
-        )
-        self.envs = env_factory.construct_envs(
-            config,
-            workers_ignore_signals=is_slurm_batch_job(),
-            enforce_scenes_greater_eq_environments=is_eval,
-            is_first_rank=(
-                not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0
-            ),
-        )
-
-        self._env_spec = EnvironmentSpec(
+        self.actor_critic = ProposedPolicyOracle(
+            agent_type = self.config.TRAINER_NAME,
             observation_space=self.envs.observation_spaces[0],
             action_space=self.envs.action_spaces[0],
-            orig_action_space=self.envs.orig_action_spaces[0],
+            hidden_size=ppo_cfg.hidden_size,
+            goal_sensor_uuid=self.config.TASK_CONFIG.TASK.GOAL_SENSOR_UUID,
+            device=self.device,
+            object_category_embedding_size=self.config.RL.OBJECT_CATEGORY_EMBEDDING_SIZE,
+            previous_action_embedding_size=self.config.RL.PREVIOUS_ACTION_EMBEDDING_SIZE,
+            use_previous_action=self.config.RL.PREVIOUS_ACTION
+        )
+        
+        logger.info("DEVICE: " + str(self.device))
+        self.actor_critic.to(self.device)
+
+        self.agent = PPOOracle(
+            actor_critic=self.actor_critic,
+            clip_param=ppo_cfg.clip_param,
+            ppo_epoch=ppo_cfg.ppo_epoch,
+            num_mini_batch=ppo_cfg.num_mini_batch,
+            value_loss_coef=ppo_cfg.value_loss_coef,
+            entropy_coef=ppo_cfg.entropy_coef,
+            lr=ppo_cfg.lr,
+            eps=ppo_cfg.eps,
+            max_grad_norm=ppo_cfg.max_grad_norm,
+            use_normalized_advantage=ppo_cfg.use_normalized_advantage,
         )
 
-        # The measure keys that should only be logged on rank0 and nowhere
-        # else. They will be excluded from all other workers and only reported
-        # from the single worker.
-        self._rank0_keys: Set[str] = set(
-            list(self.config.habitat.task.rank0_env0_measure_names)
-            + list(self.config.habitat.task.rank0_measure_names)
-        )
-
-        # Information on measures that declared in `self._rank0_keys` or
-        # to be only reported on rank0. This is seperately logged from
-        # `self.window_episode_stats`.
-        self._single_proc_infos: Dict[str, List[float]] = {}
-
-    def _init_train(self, resume_state=None):
-        if resume_state is None:
-            resume_state = load_resume_state(self.config)
-
-        if resume_state is not None:
-            if not self.config.habitat_baselines.load_resume_state_config:
-                raise FileExistsError(
-                    f"The configuration provided has habitat_baselines.load_resume_state_config=False but a previous training run exists. You can either delete the checkpoint folder {self.config.habitat_baselines.checkpoint_folder}, or change the configuration key habitat_baselines.checkpoint_folder in your new run."
-                )
-
-            self.config = self._get_resume_state_config_or_new_config(
-                resume_state["config"]
-            )
-
-        if self.config.habitat_baselines.rl.ddppo.force_distributed:
-            self._is_distributed = True
-
-        self._add_preemption_signal_handlers()
-
-        if self._is_distributed:
-            local_rank, tcp_store = init_distrib_slurm(
-                self.config.habitat_baselines.rl.ddppo.distrib_backend
-            )
-            if rank0_only():
-                logger.info(
-                    "Initialized DD-PPO with {} workers".format(
-                        torch.distributed.get_world_size()
-                    )
-                )
-
-            with read_write(self.config):
-                self.config.habitat_baselines.torch_gpu_id = local_rank
-                self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = (
-                    local_rank
-                )
-                # Multiply by the number of simulators to make sure they also get unique seeds
-                self.config.habitat.seed += (
-                    torch.distributed.get_rank()
-                    * self.config.habitat_baselines.num_environments
-                )
-
-            random.seed(self.config.habitat.seed)
-            np.random.seed(self.config.habitat.seed)
-            torch.manual_seed(self.config.habitat.seed)
-            self.num_rollouts_done_store = torch.distributed.PrefixStore(
-                "rollout_tracker", tcp_store
-            )
-            self.num_rollouts_done_store.set("num_done", "0")
-
-        if rank0_only() and self.config.habitat_baselines.verbose:
-            logger.info(f"config: {OmegaConf.to_yaml(self.config)}")
-
-        profiling_wrapper.configure(
-            capture_start_step=self.config.habitat_baselines.profiling.capture_start_step,
-            num_steps_to_capture=self.config.habitat_baselines.profiling.num_steps_to_capture,
-        )
-
-        # remove the non scalar measures from the measures since they can only be used in
-        # evaluation
-        for non_scalar_metric in NON_SCALAR_METRICS:
-            non_scalar_metric_root = non_scalar_metric.split(".")[0]
-            if non_scalar_metric_root in self.config.habitat.task.measurements:
-                with read_write(self.config):
-                    OmegaConf.set_struct(self.config, False)
-                    self.config.habitat.task.measurements.pop(
-                        non_scalar_metric_root
-                    )
-                    OmegaConf.set_struct(self.config, True)
-                if self.config.habitat_baselines.verbose:
-                    logger.info(
-                        f"Removed metric {non_scalar_metric_root} from metrics since it cannot be used during training."
-                    )
-
-        self._init_envs()
-
-        self.device = get_device(self.config)
-
-        if rank0_only() and not os.path.isdir(
-            self.config.habitat_baselines.checkpoint_folder
-        ):
-            os.makedirs(self.config.habitat_baselines.checkpoint_folder)
-
-        logger.add_filehandler(self.config.habitat_baselines.log_file)
-
-        self._agent = self._create_agent(resume_state)
-        if self._is_distributed:
-            self._agent.init_distributed(find_unused_params=False)  # type: ignore
-        self._agent.post_init()
-
-        self._is_static_encoder = (
-            not self.config.habitat_baselines.rl.ddppo.train_encoder
-        )
-        self._ppo_cfg = self.config.habitat_baselines.rl.ppo
-
-        observations = self.envs.reset()
-        observations = self.envs.post_step(observations)
-        batch = batch_obs(observations, device=self.device)
-        batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
-
-        if self._is_static_encoder:
-            self._encoder = self._agent.actor_critic.visual_encoder
-            assert (
-                self._encoder is not None
-            ), "Visual encoder is not specified for this actor"
-            with inference_mode():
-                batch[
-                    PointNavResNetNet.PRETRAINED_VISUAL_FEATURES_KEY
-                ] = self._encoder(batch)
-
-        self._agent.rollouts.insert_first_observations(batch)
-
-        self.current_episode_reward = torch.zeros(self.envs.num_envs, 1)
-        self.running_episode_stats = dict(
-            count=torch.zeros(self.envs.num_envs, 1),
-            reward=torch.zeros(self.envs.num_envs, 1),
-        )
-        self.window_episode_stats = defaultdict(
-            lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
-        )
-
-        self.t_start = time.time()
-
-    @rank0_only
-    @profiling_wrapper.RangeContext("save_checkpoint")
     def save_checkpoint(
         self, file_name: str, extra_state: Optional[Dict] = None
     ) -> None:
@@ -305,27 +237,15 @@ class PPOTrainer(BaseRLTrainer):
             None
         """
         checkpoint = {
-            **self._agent.get_save_state(),
+            "state_dict": self.agent.state_dict(),
             "config": self.config,
         }
         if extra_state is not None:
-            checkpoint["extra_state"] = extra_state  # type: ignore
+            checkpoint["extra_state"] = extra_state
 
-        save_file_path = os.path.join(
-            self.config.habitat_baselines.checkpoint_folder, file_name
-        )
-        torch.save(checkpoint, save_file_path)
         torch.save(
-            checkpoint,
-            os.path.join(
-                self.config.habitat_baselines.checkpoint_folder, "latest.pth"
-            ),
+            checkpoint, os.path.join(self.config.CHECKPOINT_FOLDER, file_name)
         )
-        if self.config.habitat_baselines.on_save_ckpt_callback is not None:
-            hydra.utils.call(
-                self.config.habitat_baselines.on_save_ckpt_callback,
-                save_file_path=save_file_path,
-            )
 
     def load_checkpoint(self, checkpoint_path: str, *args, **kwargs) -> Dict:
         r"""Load checkpoint of specified path as a dict.
@@ -340,572 +260,1686 @@ class PPOTrainer(BaseRLTrainer):
         """
         return torch.load(checkpoint_path, *args, **kwargs)
 
-    def _compute_actions_and_step_envs(self, buffer_index: int = 0):
-        num_envs = self.envs.num_envs
-        env_slice = slice(
-            int(buffer_index * num_envs / self._agent.nbuffers),
-            int((buffer_index + 1) * num_envs / self._agent.nbuffers),
-        )
+    METRICS_BLACKLIST = {"top_down_map", "collisions.is_collision", "traj_metrics", "ci"}
 
-        with g_timer.avg_time("trainer.sample_action"), inference_mode():
-            # Sample actions
-            step_batch = self._agent.rollouts.get_current_step(
-                env_slice, buffer_index
-            )
-
-            profiling_wrapper.range_push("compute actions")
-
-            # Obtain lenghts
-            step_batch_lens = {
-                k: v
-                for k, v in step_batch.items()
-                if k.startswith("index_len")
-            }
-            action_data = self._agent.actor_critic.act(
-                step_batch["observations"],
-                step_batch["recurrent_hidden_states"],
-                step_batch["prev_actions"],
-                step_batch["masks"],
-                **step_batch_lens,
-            )
-
-        profiling_wrapper.range_pop()  # compute actions
-
-        with g_timer.avg_time("trainer.obs_insert"):
-            for index_env, act in zip(
-                range(env_slice.start, env_slice.stop),
-                action_data.env_actions.cpu().unbind(0),
-            ):
-                if is_continuous_action_space(self._env_spec.action_space):
-                    # Clipping actions to the specified limits
-                    act = np.clip(
-                        act.numpy(),
-                        self._env_spec.action_space.low,
-                        self._env_spec.action_space.high,
-                    )
-                else:
-                    act = act.item()
-                self.envs.async_step_at(index_env, act)
-
-        with g_timer.avg_time("trainer.obs_insert"):
-            self._agent.rollouts.insert(
-                next_recurrent_hidden_states=action_data.rnn_hidden_states,
-                actions=action_data.actions,
-                action_log_probs=action_data.action_log_probs,
-                value_preds=action_data.values,
-                buffer_index=buffer_index,
-                should_inserts=action_data.should_inserts,
-                action_data=action_data,
-            )
-
-    def _collect_environment_result(self, buffer_index: int = 0):
-        num_envs = self.envs.num_envs
-        env_slice = slice(
-            int(buffer_index * num_envs / self._agent.nbuffers),
-            int((buffer_index + 1) * num_envs / self._agent.nbuffers),
-        )
-
-        with g_timer.avg_time("trainer.step_env"):
-            outputs = [
-                self.envs.wait_step_at(index_env)
-                for index_env in range(env_slice.start, env_slice.stop)
-            ]
-
-            observations, rewards_l, dones, infos = [
-                list(x) for x in zip(*outputs)
-            ]
-
-        with g_timer.avg_time("trainer.update_stats"):
-            observations = self.envs.post_step(observations)
-            batch = batch_obs(observations, device=self.device)
-            batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
-
-            rewards = torch.tensor(
-                rewards_l,
-                dtype=torch.float,
-                device=self.current_episode_reward.device,
-            )
-            rewards = rewards.unsqueeze(1)
-
-            not_done_masks = torch.tensor(
-                [[not done] for done in dones],
-                dtype=torch.bool,
-                device=self.current_episode_reward.device,
-            )
-            done_masks = torch.logical_not(not_done_masks)
-
-            self.current_episode_reward[env_slice] += rewards
-            current_ep_reward = self.current_episode_reward[env_slice]
-            self.running_episode_stats["reward"][env_slice] += current_ep_reward.where(done_masks, current_ep_reward.new_zeros(()))  # type: ignore
-            self.running_episode_stats["count"][env_slice] += done_masks.float()  # type: ignore
-
-            self._single_proc_infos = extract_scalars_from_infos(
-                infos,
-                ignore_keys=set(
-                    k for k in infos[0].keys() if k not in self._rank0_keys
-                ),
-            )
-            extracted_infos = extract_scalars_from_infos(
-                infos, ignore_keys=self._rank0_keys
-            )
-            for k, v_k in extracted_infos.items():
-                v = torch.tensor(
-                    v_k,
-                    dtype=torch.float,
-                    device=self.current_episode_reward.device,
-                ).unsqueeze(1)
-                if k not in self.running_episode_stats:
-                    self.running_episode_stats[k] = torch.zeros_like(
-                        self.running_episode_stats["count"]
-                    )
-                self.running_episode_stats[k][env_slice] += v.where(done_masks, v.new_zeros(()))  # type: ignore
-
-            self.current_episode_reward[env_slice].masked_fill_(
-                done_masks, 0.0
-            )
-
-        if self._is_static_encoder:
-            with inference_mode(), g_timer.avg_time("trainer.visual_features"):
-                batch[
-                    PointNavResNetNet.PRETRAINED_VISUAL_FEATURES_KEY
-                ] = self._encoder(batch)
-
-        self._agent.rollouts.insert(
-            next_observations=batch,
-            rewards=rewards,
-            next_masks=not_done_masks,
-            buffer_index=buffer_index,
-        )
-
-        self._agent.rollouts.advance_rollout(buffer_index)
-
-        return env_slice.stop - env_slice.start
-
-    @profiling_wrapper.RangeContext("_collect_rollout_step")
-    def _collect_rollout_step(self):
-        self._compute_actions_and_step_envs()
-        return self._collect_environment_result()
-
-    @profiling_wrapper.RangeContext("_update_agent")
-    @g_timer.avg_time("trainer.update_agent")
-    def _update_agent(self):
-        with inference_mode():
-            step_batch = self._agent.rollouts.get_last_step()
-            step_batch_lens = {
-                k: v
-                for k, v in step_batch.items()
-                if k.startswith("index_len")
-            }
-
-            next_value = self._agent.actor_critic.get_value(
-                step_batch["observations"],
-                step_batch.get("recurrent_hidden_states", None),
-                step_batch["prev_actions"],
-                step_batch["masks"],
-                **step_batch_lens,
-            )
-
-        self._agent.rollouts.compute_returns(
-            next_value,
-            self._ppo_cfg.use_gae,
-            self._ppo_cfg.gamma,
-            self._ppo_cfg.tau,
-        )
-
-        self._agent.train()
-
-        losses = self._agent.updater.update(self._agent.rollouts)
-
-        self._agent.rollouts.after_update()
-        self._agent.after_update()
-
-        return losses
-
-    def _coalesce_post_step(
-        self, losses: Dict[str, float], count_steps_delta: int
+    @classmethod
+    def _extract_scalars_from_info(
+        cls, info: Dict[str, Any]
     ) -> Dict[str, float]:
-        stats_ordering = sorted(self.running_episode_stats.keys())
-        stats = torch.stack(
-            [self.running_episode_stats[k] for k in stats_ordering], 0
-        )
+        result = {}
+        for k, v in info.items():
+            if k in cls.METRICS_BLACKLIST:
+                continue
 
-        stats = self._all_reduce(stats)
+            """
+            if k == "ci":
+                result[k] = float(v[0])
+            """
+                
+            if isinstance(v, dict):
+                result.update(
+                    {
+                        k + "." + subk: subv
+                        for subk, subv in cls._extract_scalars_from_info(
+                            v
+                        ).items()
+                        if (k + "." + subk) not in cls.METRICS_BLACKLIST
+                    }
+                )
+            # Things that are scalar-like will have an np.size of 1.
+            # Strings also have an np.size of 1, so explicitly ban those
+            elif np.size(v) == 1 and not isinstance(v, str):
+                result[k] = float(v)
 
-        for i, k in enumerate(stats_ordering):
-            self.window_episode_stats[k].append(stats[i])
+        return result
 
-        if self._is_distributed:
-            loss_name_ordering = sorted(losses.keys())
-            stats = torch.tensor(
-                [losses[k] for k in loss_name_ordering] + [count_steps_delta],
-                device="cpu",
-                dtype=torch.float32,
-            )
-            stats = self._all_reduce(stats)
-            count_steps_delta = int(stats[-1].item())
-            stats /= torch.distributed.get_world_size()
+    @classmethod
+    def _extract_scalars_from_infos(
+        cls, infos: List[Dict[str, Any]]
+    ) -> Dict[str, List[float]]:
 
-            losses = {
-                k: stats[i].item() for i, k in enumerate(loss_name_ordering)
+        results = defaultdict(list)
+        for i in range(len(infos)):
+            for k, v in cls._extract_scalars_from_info(infos[i]).items():
+                results[k].append(v)
+
+        return results
+    
+    
+    def _delete_observed_target(self, n):
+        object_num = 0
+        for i in self._target_index_list[n]:
+            if self._observed_object_ci_one[n][i-maps.MAP_TARGET_POINT_INDICATOR] > self.TARGET_THRESHOLD_ONE:
+                self._target_index_list[n].remove(i)
+                object_num += 1
+                
+        return object_num
+
+    
+    def _do_take_picture_object(self, top_down_map, fog_of_war_map, n):
+        # maps.MAP_TARGET_POINT_INDICATOR(6)が写真の中に何グリッドあるかを返す
+        ci = 0
+        for i in range(len(top_down_map[n])):
+            for j in range(len(top_down_map[n][0])):
+                if (i < len(fog_of_war_map[n])) and (j < len(fog_of_war_map[n][i])):
+                    if fog_of_war_map[n][i][j] == 1:
+                        if top_down_map[n][i][j] in self._target_index_list[n]:
+                            ci += 1
+                            self._observed_object_ci_one[n][top_down_map[n][i][j]-maps.MAP_TARGET_POINT_INDICATOR]+=1
+                            #if top_down_map[n][i][j] not in self._taken_index_list[n]:
+                            #self._taken_index_list[n].append(top_down_map[n][i][j])
+
+        # ciが閾値を超えているobjectがあれば削除
+        object_num_deleted = self._delete_observed_target(n)
+        
+        # もし全部のobjectが削除されたら、リセット
+        if len(self._target_index_list[n]) == 0:
+            self._target_index_list[n] = [maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2]
+            self._observed_object_ci_one[n] = [0, 0, 0]
+            
+        return ci, object_num_deleted
+        
+
+    def _collect_rollout_step(
+        self, rollouts, current_episode_reward, current_episode_exp_area, current_episode_distance, current_episode_ci, current_episode_object_num, running_episode_stats
+    ):
+        pth_time = 0.0
+        env_time = 0.0
+
+        t_sample_action = time.time()
+        # sample actions
+        with torch.no_grad():
+            step_observation = {
+                k: v[rollouts.step] for k, v in rollouts.observations.items()
             }
 
-        if self._is_distributed and rank0_only():
-            self.num_rollouts_done_store.set("num_done", "0")
-
-        self.num_steps_done += count_steps_delta
-
-        return losses
-
-    @rank0_only
-    def _training_log(
-        self, writer, losses: Dict[str, float], prev_time: int = 0
-    ):
-        deltas = {
-            k: (
-                (v[-1] - v[0]).sum().item()
-                if len(v) > 1
-                else v[0].sum().item()
+            (
+                values,
+                actions,
+                actions_log_probs,
+                recurrent_hidden_states,
+            ) = self.actor_critic.act(
+                step_observation,
+                rollouts.recurrent_hidden_states[rollouts.step],
+                rollouts.prev_actions[rollouts.step],
+                rollouts.masks[rollouts.step],
             )
-            for k, v in self.window_episode_stats.items()
-        }
-        deltas["count"] = max(deltas["count"], 1.0)
 
-        writer.add_scalar(
-            "reward",
-            deltas["reward"] / deltas["count"],
-            self.num_steps_done,
+        pth_time += time.time() - t_sample_action
+
+        t_step_env = time.time()
+
+        outputs = self.envs.step([a[0].item() for a in actions])
+        observations, rewards, dones, infos = [list(x) for x in zip(*outputs)]
+
+        env_time += time.time() - t_step_env
+
+        t_update_stats = time.time()
+        batch = batch_obs(observations, device=self.device)
+        
+        reward = []
+        ci = []
+        exp_area = [] # 探索済みのエリア()
+        exp_area_pre = []
+        distance = []
+        #matrics = []
+        fog_of_war_map = []
+        top_down_map = [] 
+        top_map = []
+        object_num = []
+        n_envs = self.envs.num_envs
+        for i in range(n_envs):
+            reward.append(rewards[i][0][0])
+            ci.append(rewards[i][0][1])
+            exp_area.append(rewards[i][0][2]-rewards[i][0][3])
+            exp_area_pre.append(rewards[i][0][3])
+            #matrics.append(rewards[i][1])
+            object_num.append(0)
+            fog_of_war_map.append(infos[i]["picture_range_map"]["fog_of_war_mask"])
+            top_down_map.append(infos[i]["picture_range_map"]["map"])
+            top_map.append(infos[i]["top_down_map"]["map"])
+            
+            # multi goal distanceの計算
+            dis = 0.0
+            dis_pre = 0
+            for j in self._target_index_list[i]:
+                dis_pre += rewards[i][0][5][j-maps.MAP_TARGET_POINT_INDICATOR]
+                dis += rewards[i][0][4][j-maps.MAP_TARGET_POINT_INDICATOR]
+            
+            reward[i] += dis_pre - dis
+            distance.append(dis_pre - dis)
+            
+        
+        for n in range(len(observations)):
+            #TAKE_PICTUREが呼び出されたかを検証
+            if ci[n] != -sys.float_info.max:
+                # 今回撮ったpicture(p_n)が保存してあるpicture(p_k)とかぶっているkを保存
+                cover_list = [] 
+                picture_range_map = self._create_picture_range_map(top_down_map[n], fog_of_war_map[n])
+                
+                ci[n], object_num[n] = self._do_take_picture_object(top_map, fog_of_war_map, n)
+                
+                if ci[n] == 0:
+                    continue
+               
+                # p_kのそれぞれのpicture_range_mapのリスト
+                pre_fog_of_war_map = [sublist[1] for sublist in self._taken_picture_list[n]]
+                    
+                # それぞれと閾値より被っているか計算
+                idx = -1
+                min_ci = ci[n]
+                for k in range(len(pre_fog_of_war_map)):
+                    # 閾値よりも被っていたらcover_listにkを追加
+                    if self._check_percentage_of_fog(picture_range_map, pre_fog_of_war_map[k]) == True:
+                        cover_list.append(k)
+                            
+                    #ciの最小値の写真を探索(１つも被っていない時用)
+                    if min_ci < self._taken_picture_list[n][idx][0]:
+                        idx = k
+                        min_ci = self._taken_picture_list[n][idx][0]
+                        
+                # 今までの写真と多くは被っていない時
+                if len(cover_list) == 0:
+                    #範囲が多く被っていなくて、self._num_picture回未満写真を撮っていたらそのまま保存
+                    if len(self._taken_picture_list[n]) != self._num_picture:
+                        self._taken_picture_list[n].append([ci[n], picture_range_map])
+                        #self._taken_picture[n].append(observations[n]["rgb"])
+                        reward[n] += ci[n]
+                            
+                    #範囲が多く被っていなくて、self._num_picture回以上写真を撮っていたら
+                    else:
+                        # 今回の写真が保存してある写真の１つでもCIが高かったらCIが最小の保存写真と入れ替え
+                        if idx != -1:
+                            ci_pre = self._taken_picture_list[n][idx][0]
+                            self._taken_picture_list[n][idx] = [ci[n], picture_range_map]
+                            #self._taken_picture[n][idx] = observations[n]["rgb"]   
+                            reward[n] += (ci[n] - ci_pre)     
+                            ci[n] -= ci_pre
+                        else:
+                            ci[n] = 0.0
+                        
+                # 1つとでも多く被っていた時    
+                else:
+                    min_idx = -1
+                    min_ci_k = 1000
+                    # 多く被った写真のうち、ciが最小のものを計算
+                    for k in range(len(cover_list)):
+                        idx_k = cover_list[k]
+                        if self._taken_picture_list[n][idx_k][0] < min_ci_k:
+                            min_ci_k = self._taken_picture_list[n][idx_k][0]
+                            min_idx = idx_k
+                                
+                    # 被った割合分小さくなったCIでも保存写真の中の最小のCIより大きかったら交換
+                    if self._compareWithChangedCI(picture_range_map, pre_fog_of_war_map, cover_list, ci[n], min_ci_k, min_idx) == True:
+                        self._taken_picture_list[n][min_idx] = [ci[n], picture_range_map]
+                        #self._taken_picture[n][min_idx] = observations[n]["rgb"]   
+                        reward[n] += (ci[n] - min_ci_k)  
+                        ci[n] -= min_ci_k
+                    else:
+                        ci[n] = 0.0
+            else:
+                ci[n] = 0.0
+            
+        reward = torch.tensor(
+            reward, dtype=torch.float, device=current_episode_reward.device
+        ).unsqueeze(1)
+        exp_area = torch.tensor(
+           exp_area, dtype=torch.float, device=current_episode_reward.device
+        ).unsqueeze(1)
+        ci = torch.tensor(
+           ci, dtype=torch.float, device=current_episode_reward.device
+        ).unsqueeze(1)
+        distance = torch.tensor(
+           distance, dtype=torch.float, device=current_episode_reward.device
+        ).unsqueeze(1)
+        object_num = torch.tensor(
+           object_num, dtype=torch.float, device=current_episode_reward.device
+        ).unsqueeze(1)
+        
+
+        masks = torch.tensor(
+            [[0.0] if done else [1.0] for done in dones],
+            dtype=torch.float,
+            device=current_episode_reward.device,
+        )
+        
+        # episode ended
+        for n in range(len(observations)):
+            if masks[n].item() == 0.0:
+                """
+                for i in range(self._num_picture):
+                    if i < len(self._taken_picture_list[n]):
+                        self.take_picture_writer.write(str(self._taken_picture_list[n][i][0]))
+                        self.picture_position_writer.write(str(self._taken_picture_list[n][i][1][0]) + "," + str(self._taken_picture_list[n][i][1][1]) + "," + str(self._taken_picture_list[n][i][1][2]))
+                    else:
+                        self.take_picture_writer.write(" ")
+                        self.picture_position_writer.write(" ")
+                        
+                self.take_picture_writer.writeLine()
+                self.picture_position_writer.writeLine()
+                """
+                #self._taken_picture[n] = []
+                self._taken_picture_list[n] = []
+                self._target_index_list[n] = [maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2]
+                
+
+        current_episode_reward += reward
+        running_episode_stats["reward"] += (1 - masks) * current_episode_reward
+        current_episode_exp_area += exp_area
+        running_episode_stats["exp_area"] += (1 - masks) * current_episode_exp_area
+        current_episode_distance += distance
+        running_episode_stats["distance"] += (1 - masks) * current_episode_distance
+        current_episode_ci += ci
+        running_episode_stats["ci"] += (1 - masks) * current_episode_ci
+        current_episode_object_num += object_num
+        running_episode_stats["object_num"] += (1 - masks) * current_episode_object_num
+        running_episode_stats["count"] += 1 - masks
+
+        for k, v in self._extract_scalars_from_infos(infos).items():
+            v = torch.tensor(
+                v, dtype=torch.float, device=current_episode_reward.device
+            ).unsqueeze(1)
+            if k not in running_episode_stats:
+                running_episode_stats[k] = torch.zeros_like(
+                    running_episode_stats["count"]
+                )
+
+            running_episode_stats[k] += (1 - masks) * v
+
+    
+        current_episode_reward *= masks
+        current_episode_exp_area *= masks
+        current_episode_distance *= masks
+        current_episode_ci *= masks
+        current_episode_object_num *= masks
+
+        if self._static_encoder:
+            with torch.no_grad():
+                batch["visual_features"] = self._encoder(batch)
+
+        rollouts.insert(
+            batch,
+            recurrent_hidden_states,
+            actions,
+            actions_log_probs,
+            values,
+            reward,
+            masks,
         )
 
-        # Check to see if there are any metrics
-        # that haven't been logged yet
-        metrics = {
-            k: v / deltas["count"]
-            for k, v in deltas.items()
-            if k not in {"reward", "count"}
-        }
+        pth_time += time.time() - t_update_stats
 
-        for k, v in metrics.items():
-            writer.add_scalar(f"metrics/{k}", v, self.num_steps_done)
-        for k, v in losses.items():
-            writer.add_scalar(f"learner/{k}", v, self.num_steps_done)
+        return pth_time, env_time, self.envs.num_envs
 
-        for k, v in self._single_proc_infos.items():
-            writer.add_scalar(k, np.mean(v), self.num_steps_done)
+    def _update_agent(self, ppo_cfg, rollouts):
+        t_update_model = time.time()
+        with torch.no_grad():
+            last_observation = {
+                k: v[rollouts.step] for k, v in rollouts.observations.items()
+            }
+            next_value = self.actor_critic.get_value(
+                last_observation,
+                rollouts.recurrent_hidden_states[rollouts.step],
+                rollouts.prev_actions[rollouts.step],
+                rollouts.masks[rollouts.step],
+            ).detach()
 
-        fps = self.num_steps_done / ((time.time() - self.t_start) + prev_time)
+        rollouts.compute_returns(
+            next_value, ppo_cfg.use_gae, ppo_cfg.gamma, ppo_cfg.tau
+        )
 
-        # Log perf metrics.
-        writer.add_scalar("perf/fps", fps, self.num_steps_done)
+        value_loss, action_loss, dist_entropy = self.agent.update(rollouts)
 
-        for timer_name, timer_val in g_timer.items():
-            writer.add_scalar(
-                f"perf/{timer_name}",
-                timer_val.mean,
-                self.num_steps_done,
-            )
+        rollouts.after_update()
 
-        # log stats
-        if (
-            self.num_updates_done % self.config.habitat_baselines.log_interval
-            == 0
-        ):
-            logger.info(
-                "update: {}\tfps: {:.3f}\t".format(
-                    self.num_updates_done,
-                    fps,
-                )
-            )
-
-            logger.info(
-                f"Num updates: {self.num_updates_done}\tNum frames {self.num_steps_done}"
-            )
-
-            logger.info(
-                "Average window size: {}  {}".format(
-                    len(self.window_episode_stats["count"]),
-                    "  ".join(
-                        "{}: {:.3f}".format(k, v / deltas["count"])
-                        for k, v in deltas.items()
-                        if k != "count"
-                    ),
-                )
-            )
-            perf_stats_str = " ".join(
-                [f"{k}: {v.mean:.3f}" for k, v in g_timer.items()]
-            )
-            logger.info(f"\tPerf Stats: {perf_stats_str}")
-            if self.config.habitat_baselines.should_log_single_proc_infos:
-                for k, v in self._single_proc_infos.items():
-                    logger.info(f" - {k}: {np.mean(v):.3f}")
-
-    def should_end_early(self, rollout_step) -> bool:
-        if not self._is_distributed:
-            return False
-        # This is where the preemption of workers happens.  If a
-        # worker detects it will be a straggler, it preempts itself!
         return (
-            rollout_step
-            >= self.config.habitat_baselines.rl.ppo.num_steps
-            * self.SHORT_ROLLOUT_THRESHOLD
-        ) and int(self.num_rollouts_done_store.get("num_done")) >= (
-            self.config.habitat_baselines.rl.ddppo.sync_frac
-            * torch.distributed.get_world_size()
+            time.time() - t_update_model,
+            value_loss,
+            action_loss,
+            dist_entropy,
         )
 
-    @profiling_wrapper.RangeContext("train")
-    def train(self) -> None:
-        r"""Main method for training DD/PPO.
+
+    def train(self, log_manager, date) -> None:
+        r"""Main method for training PPO.
 
         Returns:
             None
         """
+        self.log_manager = log_manager
+        
+        #ログ出力設定
+        #time, reward
+        reward_logger = self.log_manager.createLogWriter("reward")
+        #time, learning_rate
+        learning_rate_logger = self.log_manager.createLogWriter("learning_rate")
+        #time, found, forward, left, right, look_up, look_down
+        action_logger = self.log_manager.createLogWriter("action_prob")
+        #time, picture, ci, episode_length
+        metrics_logger = self.log_manager.createLogWriter("metrics")
+        #time, losses_value, losses_policy
+        loss_logger = self.log_manager.createLogWriter("loss")
+        
+        self.take_picture_writer = self.log_manager.createLogWriter("take_picture")
+        self.picture_position_writer = self.log_manager.createLogWriter("picture_position")
 
-        resume_state = load_resume_state(self.config)
-        self._init_train(resume_state)
+        self.envs = construct_envs(
+            self.config, get_env_class(self.config.ENV_NAME)
+        )
+        
+        for _ in range(self.envs.num_envs):
+            #self._taken_picture.append([])
+            self._taken_picture_list.append([])
+            self._target_index_list.append([maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2])
+            self._observed_object_ci_one.append([0, 0, 0])
 
+        ppo_cfg = self.config.RL.PPO
+        self.device = (
+            torch.device("cuda", self.config.TORCH_GPU_ID)
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        if not os.path.isdir(self.config.CHECKPOINT_FOLDER):
+            os.makedirs(self.config.CHECKPOINT_FOLDER)
+        self._setup_actor_critic_agent(ppo_cfg)
+        logger.info(
+            "agent number of parameters: {}".format(
+                sum(param.numel() for param in self.agent.parameters())
+            )
+        )
+
+        rollouts = RolloutStorageOracle(
+            ppo_cfg.num_steps,
+            self.envs.num_envs,
+            self.envs.observation_spaces[0],
+            self.envs.action_spaces[0],
+            ppo_cfg.hidden_size,
+        )
+        rollouts.to(self.device)
+
+        observations = self.envs.reset()
+        batch = batch_obs(observations, device=self.device)
+
+        for sensor in rollouts.observations:
+            rollouts.observations[sensor][0].copy_(batch[sensor])
+
+        # batch and observations may contain shared PyTorch CUDA
+        # tensors.  We must explicitly clear them here otherwise
+        # they will be kept in memory for the entire duration of training!
+        batch = None
+        observations = None
+
+        current_episode_reward = torch.zeros(self.envs.num_envs, 1, device=self.device)
+        current_episode_exp_area = torch.zeros(self.envs.num_envs, 1, device=self.device)
+        current_episode_distance = torch.zeros(self.envs.num_envs, 1, device=self.device)
+        current_episode_ci = torch.zeros(self.envs.num_envs, 1, device=self.device)
+        current_episode_object_num = torch.zeros(self.envs.num_envs, 1, device=self.device)
+        running_episode_stats = dict(
+            count=torch.zeros(self.envs.num_envs, 1, device=current_episode_reward.device),
+            reward=torch.zeros(self.envs.num_envs, 1, device=current_episode_reward.device),
+            exp_area=torch.zeros(self.envs.num_envs, 1, device=current_episode_reward.device),
+            distance=torch.zeros(self.envs.num_envs, 1, device=current_episode_reward.device),
+            ci=torch.zeros(self.envs.num_envs, 1, device=current_episode_reward.device),
+            object_num=torch.zeros(self.envs.num_envs, 1, device=current_episode_reward.device),
+        )
+        window_episode_stats = defaultdict(
+            lambda: deque(maxlen=ppo_cfg.reward_window_size)
+        )
+
+        t_start = time.time()
+        env_time = 0
+        pth_time = 0
+        count_steps = 0
         count_checkpoints = 0
-        prev_time = 0
 
-        if self._is_distributed:
-            torch.distributed.barrier()
+        lr_scheduler = LambdaLR(
+            optimizer=self.agent.optimizer,
+            lr_lambda=lambda x: linear_decay(x, self.config.NUM_UPDATES),
+        )
 
-        resume_run_id = None
-        if resume_state is not None:
-            self._agent.load_state_dict(resume_state)
+        os.makedirs(self.config.TENSORBOARD_DIR + "/" + date, exist_ok=True)
+        
+        for update in range(self.config.NUM_UPDATES):
+            if ppo_cfg.use_linear_lr_decay:
+                lr_scheduler.step()
 
-            requeue_stats = resume_state["requeue_stats"]
-            self.num_steps_done = requeue_stats["num_steps_done"]
-            self.num_updates_done = requeue_stats["num_updates_done"]
-            self._last_checkpoint_percent = requeue_stats[
-                "_last_checkpoint_percent"
-            ]
-            count_checkpoints = requeue_stats["count_checkpoints"]
-            prev_time = requeue_stats["prev_time"]
-
-            self.running_episode_stats = requeue_stats["running_episode_stats"]
-            self.window_episode_stats.update(
-                requeue_stats["window_episode_stats"]
-            )
-            resume_run_id = requeue_stats.get("run_id", None)
-
-        with (
-            get_writer(
-                self.config,
-                resume_run_id=resume_run_id,
-                flush_secs=self.flush_secs,
-                purge_step=int(self.num_steps_done),
-            )
-            if rank0_only()
-            else contextlib.suppress()
-        ) as writer:
-            while not self.is_done():
-                profiling_wrapper.on_start_step()
-                profiling_wrapper.range_push("train update")
-
-                self._agent.pre_rollout()
-
-                if rank0_only() and self._should_save_resume_state():
-                    requeue_stats = dict(
-                        count_checkpoints=count_checkpoints,
-                        num_steps_done=self.num_steps_done,
-                        num_updates_done=self.num_updates_done,
-                        _last_checkpoint_percent=self._last_checkpoint_percent,
-                        prev_time=(time.time() - self.t_start) + prev_time,
-                        running_episode_stats=self.running_episode_stats,
-                        window_episode_stats=dict(self.window_episode_stats),
-                        run_id=writer.get_run_id(),
-                    )
-
-                    save_resume_state(
-                        dict(
-                            **self._agent.get_resume_state(),
-                            config=self.config,
-                            requeue_stats=requeue_stats,
-                        ),
-                        self.config,
-                    )
-
-                if EXIT.is_set():
-                    profiling_wrapper.range_pop()  # train update
-
-                    self.envs.close()
-
-                    requeue_job()
-
-                    return
-
-                self._agent.eval()
-                count_steps_delta = 0
-                profiling_wrapper.range_push("rollouts loop")
-
-                profiling_wrapper.range_push("_collect_rollout_step")
-                with g_timer.avg_time("trainer.rollout_collect"):
-                    for buffer_index in range(self._agent.nbuffers):
-                        self._compute_actions_and_step_envs(buffer_index)
-
-                    for step in range(self._ppo_cfg.num_steps):
-                        is_last_step = (
-                            self.should_end_early(step + 1)
-                            or (step + 1) == self._ppo_cfg.num_steps
-                        )
-
-                        for buffer_index in range(self._agent.nbuffers):
-                            count_steps_delta += (
-                                self._collect_environment_result(buffer_index)
-                            )
-
-                            if (buffer_index + 1) == self._agent.nbuffers:
-                                profiling_wrapper.range_pop()  # _collect_rollout_step
-
-                            if not is_last_step:
-                                if (buffer_index + 1) == self._agent.nbuffers:
-                                    profiling_wrapper.range_push(
-                                        "_collect_rollout_step"
-                                    )
-
-                                self._compute_actions_and_step_envs(
-                                    buffer_index
-                                )
-
-                        if is_last_step:
-                            break
-
-                profiling_wrapper.range_pop()  # rollouts loop
-
-                if self._is_distributed:
-                    self.num_rollouts_done_store.add("num_done", 1)
-
-                losses = self._update_agent()
-
-                self.num_updates_done += 1
-                losses = self._coalesce_post_step(
-                    losses,
-                    count_steps_delta,
+            if ppo_cfg.use_linear_clip_decay:
+                self.agent.clip_param = ppo_cfg.clip_param * linear_decay(
+                    update, self.config.NUM_UPDATES
                 )
 
-                self._training_log(writer, losses, prev_time)
+            for step in range(ppo_cfg.num_steps):
+                if (step + update*ppo_cfg.num_steps) % 500 == 0:
+                    print("STEP: " + str(step + update*ppo_cfg.num_steps))
+                    
+                # 毎ステップ初期化する
+                for n in range(self.envs.num_envs):
+                    self._observed_object_ci_one[n] = [0, 0, 0]
+                    
+                (
+                    delta_pth_time,
+                    delta_env_time,
+                    delta_steps,
+                ) = self._collect_rollout_step(
+                    rollouts, current_episode_reward, current_episode_exp_area, current_episode_distance, current_episode_ci, current_episode_object_num, running_episode_stats
+                )
+                pth_time += delta_pth_time
+                env_time += delta_env_time
+                count_steps += delta_steps
 
-                # checkpoint model
-                if rank0_only() and self.should_checkpoint():
-                    self.save_checkpoint(
-                        f"ckpt.{count_checkpoints}.pth",
-                        dict(
-                            step=self.num_steps_done,
-                            wall_time=(time.time() - self.t_start) + prev_time,
+            (
+                delta_pth_time,
+                value_loss,
+                action_loss,
+                dist_entropy,
+            ) = self._update_agent(ppo_cfg, rollouts)
+            pth_time += delta_pth_time
+                
+            for k, v in running_episode_stats.items():
+                window_episode_stats[k].append(v.clone())
+
+            deltas = {
+                k: (
+                    (v[-1] - v[0]).sum().item()
+                    if len(v) > 1
+                    else v[0].sum().item()
+                )
+                for k, v in window_episode_stats.items()
+            }
+            deltas["count"] = max(deltas["count"], 1.0)
+                
+            #csv
+            reward_logger.writeLine(str(count_steps) + "," + str(deltas["reward"] / deltas["count"]))
+            learning_rate_logger.writeLine(str(count_steps) + "," + str(lr_scheduler._last_lr[0]))
+
+            total_actions = rollouts.actions.shape[0] * rollouts.actions.shape[1]
+            total_found_actions = int(torch.sum(rollouts.actions == 0).cpu().numpy())
+            total_forward_actions = int(torch.sum(rollouts.actions == 1).cpu().numpy())
+            total_left_actions = int(torch.sum(rollouts.actions == 2).cpu().numpy())
+            total_right_actions = int(torch.sum(rollouts.actions == 3).cpu().numpy())
+            total_look_up_actions = int(torch.sum(rollouts.actions == 4).cpu().numpy())
+            total_look_down_actions = int(torch.sum(rollouts.actions == 5).cpu().numpy())
+            assert total_actions == (total_found_actions + total_forward_actions + 
+                total_left_actions + total_right_actions + total_look_up_actions + 
+                total_look_down_actions
+            )
+                
+            # csv
+            action_logger.writeLine(
+                str(count_steps) + "," + str(total_found_actions/total_actions) + ","
+                + str(total_forward_actions/total_actions) + "," + str(total_left_actions/total_actions) + ","
+                + str(total_right_actions/total_actions) + "," + str(total_look_up_actions/total_actions) + ","
+                + str(total_look_down_actions/total_actions)
+            )
+            metrics = {
+                k: v / deltas["count"]
+                for k, v in deltas.items()
+                if k not in {"reward", "count"}
+            }
+
+            if len(metrics) > 0:
+                logger.info("COUNT: " + str(deltas["count"]))
+                logger.info("CI:" + str(metrics["ci"]))
+                logger.info("OBJECT_NUM: " + str(metrics["object_num"]))
+                logger.info("REWARD: " + str(deltas["reward"] / deltas["count"]))
+                metrics_logger.writeLine(str(count_steps) + "," +str(metrics["ci"]) + "," + str(metrics["exp_area"]) + "," + str(metrics["distance"]) + "," + str(metrics["raw_metrics.agent_path_length"]) + "," + str(metrics["object_num"]))
+                    
+                logger.info(metrics)
+            
+            loss_logger.writeLine(str(count_steps) + "," + str(value_loss) + "," + str(action_loss))
+                
+
+            # log stats
+            if update > 0 and update % self.config.LOG_INTERVAL == 0:
+                logger.info(
+                    "update: {}\tfps: {:.3f}\t".format(
+                        update, count_steps / (time.time() - t_start)
+                    )
+                )
+
+                logger.info(
+                    "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
+                    "frames: {}".format(
+                        update, env_time, pth_time, count_steps
+                    )
+                )
+
+                logger.info(
+                    "Average window size: {}  {}".format(
+                        len(window_episode_stats["count"]),
+                        "  ".join(
+                            "{}: {:.3f}".format(k, v / deltas["count"])
+                            for k, v in deltas.items()
+                            if k != "count"
                         ),
                     )
-                    count_checkpoints += 1
+                )
 
-                profiling_wrapper.range_pop()  # train update
+            # checkpoint model
+            if update % self.config.CHECKPOINT_INTERVAL == 0:
+                self.save_checkpoint(
+                    f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
+                )
+                count_checkpoints += 1
 
-            self.envs.close()
+        self.envs.close()
+            
+            
+    # 写真を撮った範囲のマップを作成
+    def _create_picture_range_map(self, top_down_map, fog_of_war_map):
+        # 0: 壁など, 1: 写真を撮った範囲, 2: 巡回可能領域
+        picture_range_map = np.zeros_like(top_down_map)
+        for i in range(len(top_down_map)):
+            for j in range(len(top_down_map[0])):
+                if top_down_map[i][j] != 0:
+                    if fog_of_war_map[i][j] == 1:
+                        picture_range_map[i][j] = 1
+                    else:
+                        picture_range_map[i][j] = 2
+                        
+        return picture_range_map
+            
+    # fog_mapがpre_fog_mapと閾値以上の割合で被っているか
+    def _check_percentage_of_fog(self, fog_map, pre_fog_map, threshold=0.25):
+        y = len(fog_map)
+        x = len(fog_map[0])
+        
+        num = 0 #fog_mapのMAP_VALID_POINTの数
+        num_covered = 0 #pre_fog_mapと被っているグリッド数
+        
+        y_pre = len(pre_fog_map)
+        x_pre = len(pre_fog_map[0])
+        
+        
+        if (x==x_pre) and (y==y_pre):
+            for i in range(y):
+                for j in range(x):
+                    # fog_mapで写真を撮っている範囲の時
+                    if fog_map[i][j] == 1:
+                        num += 1
+                        # fogとpre_fogがかぶっている時
+                        if pre_fog_map[i][j] == 1:
+                            num_covered += 1
+                            
+            if num == 0:
+                per = 0.0
+            else:
+                per = num_covered / num
+            
+            if per < threshold:
+                return False
+            else:
+                return True
+        else:
+            False
+        
+    # fog_mapがidx以外のpre_fog_mapと被っている割合を算出
+    def _cal_rate_of_fog_other(self, fog_map, pre_fog_of_war_map_list, cover_list, idx):
+        y = len(fog_map)
+        x = len(fog_map[0])
+        
+        num = 0.0 #fog_mapのMAP_VALID_POINTの数
+        num_covered = 0.0 #pre_fog_mapのどれかと被っているグリッド数
+        
+        for i in range(y):
+            for j in range(x):
+                # fog_mapで写真を撮っている範囲の時
+                if fog_map[i][j] == 1:
+                    num += 1
+                    
+                    # 被っているmapを検査する
+                    for k in range(len(cover_list)):
+                        map_idx = cover_list[k]
+                        if map_idx == idx:
+                            continue
+                        
+                        pre_map = pre_fog_of_war_map_list[map_idx]
+                        # fogとpre_fogがかぶっている時
+                        if pre_map[i][j] == 1:
+                            num_covered += 1
+                            break
+                        
+        if num == 0:
+            rate = 0.0
+        else:
+            rate = num_covered / num
+        
+        return rate
+    
+    
+    def _compareWithChangedCI(self, picture_range_map, pre_fog_of_war_map_list, cover_list, ci, pre_ci, idx):
+        rate = self._cal_rate_of_fog_other(picture_range_map, pre_fog_of_war_map_list, cover_list, idx)
+        ci = ci * (1-rate) # k以外と被っている割合分小さくする
+        if ci > pre_ci:
+            return True
+        else:
+            return False
+        
 
     def _eval_checkpoint(
         self,
         checkpoint_path: str,
-        writer: TensorboardWriter,
+        log_manager: LogManager,
+        date: str,
         checkpoint_index: int = 0,
     ) -> None:
-        r"""Evaluates a single checkpoint.
-
-        Args:
-            checkpoint_path: path of checkpoint
-            writer: tensorboard writer object for logging to tensorboard
-            checkpoint_index: index of cur checkpoint for logging
-
-        Returns:
-            None
+        
+        self.log_manager = log_manager
+        #ログ出力設定
+        #time, reward
+        eval_reward_logger = self.log_manager.createLogWriter("reward")
+        #time, ci, exp_area, distance. path_length
+        eval_metrics_logger = self.log_manager.createLogWriter("metrics")
+        eval_ci_logger = self.log_manager.createLogWriter("ci")
+        #フォルダがない場合は、作成
         """
-        if self._is_distributed:
-            raise RuntimeError("Evaluation does not support distributed mode")
+        p_dir = pathlib.Path("./log/" + date + "/eval/Picture")
+        if not p_dir.exists():
+            p_dir.mkdir(parents=True)
+        """
+        
+        # Map location CPU is almost always better than mapping to a CUDA device.
+        ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
+        print("PATH")
+        print(checkpoint_path)
 
-        # Some configurations require not to load the checkpoint, like when using
-        # a hierarchial policy
-        if self.config.habitat_baselines.eval.should_load_ckpt:
-            # map_location="cpu" is almost always better than mapping to a CUDA device.
-            ckpt_dict = self.load_checkpoint(
-                checkpoint_path, map_location="cpu"
-            )
-            step_id = ckpt_dict["extra_state"]["step"]
-            logger.info(f"Loaded checkpoint trained for {step_id} steps")
+        if self.config.EVAL.USE_CKPT_CONFIG:
+            config = self._setup_eval_config(ckpt_dict["config"])
         else:
-            ckpt_dict = {"config": None}
+            config = self.config.clone()
 
-        if "config" not in ckpt_dict:
-            ckpt_dict["config"] = None
+        ppo_cfg = config.RL.PPO
 
-        config = self._get_resume_state_config_or_new_config(
-            ckpt_dict["config"]
+        config.defrost()
+        config.TASK_CONFIG.DATASET.SPLIT = config.EVAL.SPLIT
+        config.freeze()
+
+        if len(self.config.VIDEO_OPTION) > 0:
+            config.defrost()
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP")
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("COLLISIONS")
+            config.freeze()
+
+        logger.info(f"env config: {config}")
+        self.envs = construct_envs(config, get_env_class(config.ENV_NAME))
+        self._setup_actor_critic_agent(ppo_cfg)
+
+        self.agent.load_state_dict(ckpt_dict["state_dict"])
+        self.actor_critic = self.agent.actor_critic
+        
+        self._taken_picture = []
+        self._taken_picture_list = []
+        self._target_index_list = []
+        self._taken_index_list = []
+        # 1回のCIを保存
+        self._observed_object_ci_one = []
+        
+        for i in range(self.envs.num_envs):
+            self._taken_picture.append([])
+            self._taken_picture_list.append([])
+            self._target_index_list.append([maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2])
+            self._taken_index_list.append([])
+            self._observed_object_ci_one.append([0, 0, 0])
+        
+        observations = self.envs.reset()
+        batch = batch_obs(observations, device=self.device)
+
+        current_episode_reward = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
         )
-        with read_write(config):
-            config.habitat.dataset.split = config.habitat_baselines.eval.split
+        current_episode_exp_area = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_distance = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_ci = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_object_num = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        
+        test_recurrent_hidden_states = torch.zeros(
+            self.actor_critic.net.num_recurrent_layers,
+            self.config.NUM_PROCESSES,
+            ppo_cfg.hidden_size,
+            device=self.device,
+        )
+        prev_actions = torch.zeros(
+            self.config.NUM_PROCESSES, 1, device=self.device, dtype=torch.long
+        )
+        not_done_masks = torch.zeros(
+            self.config.NUM_PROCESSES, 1, device=self.device
+        )
+        stats_episodes = dict()  # dict of dicts that stores stats per episode
+        raw_metrics_episodes = dict()
 
-        if len(self.config.habitat_baselines.eval.video_option) > 0:
-            n_agents = len(config.habitat.simulator.agents)
-            for agent_i in range(n_agents):
-                agent_name = config.habitat.simulator.agents_order[agent_i]
-                agent_config = get_agent_config(
-                    config.habitat.simulator, agent_i
+        rgb_frames = [
+            [] for _ in range(self.config.NUM_PROCESSES)
+        ]  # type: List[List[np.ndarray]]
+        if len(self.config.VIDEO_OPTION) > 0:
+            os.makedirs(self.config.VIDEO_DIR+"/"+date, exist_ok=True)
+
+        pbar = tqdm.tqdm(total=self.config.TEST_EPISODE_COUNT)
+        self.actor_critic.eval()
+        while (
+            len(stats_episodes) < self.config.TEST_EPISODE_COUNT
+            and self.envs.num_envs > 0
+        ):
+            current_episodes = self.envs.current_episodes()
+
+            with torch.no_grad():
+                (
+                    _,
+                    actions,
+                    _,
+                    test_recurrent_hidden_states,
+                ) = self.actor_critic.act(
+                    batch,
+                    test_recurrent_hidden_states,
+                    prev_actions,
+                    not_done_masks,
+                    deterministic=False,
                 )
 
-                agent_sensors = agent_config.sim_sensors
-                extra_sensors = config.habitat_baselines.eval.extra_sim_sensors
-                with read_write(agent_sensors):
-                    agent_sensors.update(extra_sensors)
-                with read_write(config):
-                    if config.habitat.gym.obs_keys is not None:
-                        for render_view in extra_sensors.values():
-                            if (
-                                render_view.uuid
-                                not in config.habitat.gym.obs_keys
-                            ):
-                                if n_agents > 1:
-                                    config.habitat.gym.obs_keys.append(
-                                        f"{agent_name}_{render_view.uuid}"
-                                    )
-                                else:
-                                    config.habitat.gym.obs_keys.append(
-                                        render_view.uuid
-                                    )
+                prev_actions.copy_(actions)
 
-        if config.habitat_baselines.verbose:
-            logger.info(f"env config: {OmegaConf.to_yaml(config)}")
+            outputs = self.envs.step([a[0].item() for a in actions])
+ 
+            observations, rewards, dones, infos = [
+                list(x) for x in zip(*outputs)
+            ]
+            batch = batch_obs(observations, device=self.device)
+            
+            not_done_masks = torch.tensor(
+                [[0.0] if done else [1.0] for done in dones],
+                dtype=torch.float,
+                device=self.device,
+            )
+            
+            for n in range(self.envs.num_envs):
+                self._observed_object_ci_one[n] = [0, 0, 0] 
+            
+            reward = []
+            ci = []
+            exp_area = [] # 探索済みのエリア()
+            exp_area_pre = []
+            distance = []
+            #matrics = []
+            fog_of_war_map = []
+            top_down_map = [] 
+            top_map = []
+            object_num = []
+            n_envs = self.envs.num_envs
+            
+            for i in range(n_envs):
+                reward.append(rewards[i][0][0])
+                ci.append(rewards[i][0][1])
+                exp_area.append(rewards[i][0][2]-rewards[i][0][3])
+                exp_area_pre.append(rewards[i][0][3])
+                #matrics.append(rewards[i][1])
+                fog_of_war_map.append(infos[i]["picture_range_map"]["fog_of_war_mask"])
+                top_down_map.append(infos[i]["picture_range_map"]["map"])
+                top_map.append(infos[i]["top_down_map"]["map"])
+                object_num.append(0)
+                
+                # multi goal distanceの計算
+                dis = 0.0
+                dis_pre = 0
+                for j in self._target_index_list[i]:
+                    dis_pre += rewards[i][0][5][j-maps.MAP_TARGET_POINT_INDICATOR]
+                    dis += rewards[i][0][4][j-maps.MAP_TARGET_POINT_INDICATOR]
+            
+                reward[i] += dis_pre - dis
+                distance.append(dis_pre - dis)
+            
+            for n in range(len(observations)):
+            #TAKE_PICTUREが呼び出されたかを検証
+                if ci[n] != -sys.float_info.max:
+                    # 今回撮ったpicture(p_n)が保存してあるpicture(p_k)とかぶっているkを保存
+                    cover_list = [] 
+                    picture_range_map = self._create_picture_range_map(top_down_map[n], fog_of_war_map[n])
+                    ci[n], object_num[n] = self._do_take_picture_object(top_map, fog_of_war_map, n)
+                    
+                    if ci[n] == 0:
+                        continue
+                    
+                    # p_kのそれぞれのpicture_range_mapのリスト
+                    pre_fog_of_war_map = [sublist[1] for sublist in self._taken_picture_list[n]]
+                        
+                    # それぞれと閾値より被っているか計算
+                    idx = -1
+                    min_ci = ci[n]
+                    for k in range(len(pre_fog_of_war_map)):
+                        # 閾値よりも被っていたらcover_listにkを追加
+                        if self._check_percentage_of_fog(picture_range_map, pre_fog_of_war_map[k]) == True:
+                            cover_list.append(k)
+                                
+                        #ciの最小値の写真を探索(１つも被っていない時用)
+                        if min_ci < self._taken_picture_list[n][idx][0]:
+                            idx = k
+                            min_ci = self._taken_picture_list[n][idx][0]
+                            
+                    # 今までの写真と多くは被っていない時
+                    if len(cover_list) == 0:
+                        #範囲が多く被っていなくて、self._num_picture回未満写真を撮っていたらそのまま保存
+                        if len(self._taken_picture_list[n]) != self._num_picture:
+                            self._taken_picture_list[n].append([ci[n], picture_range_map])
+                            if len(self.config.VIDEO_OPTION) > 0:
+                                self._taken_picture[n].append(observations[n]["rgb"])
+                            reward[n] += ci[n]
+                                
+                        #範囲が多く被っていなくて、self._num_picture回以上写真を撮っていたら
+                        else:
+                            # 今回の写真が保存してある写真の１つでもCIが高かったらCIが最小の保存写真と入れ替え
+                            if idx != -1:
+                                ci_pre = self._taken_picture_list[n][idx][0]
+                                self._taken_picture_list[n][idx] = [ci[n], picture_range_map]
+                                if len(self.config.VIDEO_OPTION) > 0:
+                                    self._taken_picture[n][idx] = observations[n]["rgb"]   
+                                reward[n] += (ci[n] - ci_pre) 
+                                ci[n] -= ci_pre
+                            else:
+                                ci[n] = 0.0    
+                            
+                    # 1つとでも多く被っていた時    
+                    else:
+                        min_idx = -1
+                        min_ci_k = 1000
+                        # 多く被った写真のうち、ciが最小のものを計算
+                        for k in range(len(cover_list)):
+                            idx_k = cover_list[k]
+                            if self._taken_picture_list[n][idx_k][0] < min_ci_k:
+                                min_ci_k = self._taken_picture_list[n][idx_k][0]
+                                min_idx = idx_k
+                                    
+                        # 被った割合分小さくなったCIでも保存写真の中の最小のCIより大きかったら交換
+                        if self._compareWithChangedCI(picture_range_map, pre_fog_of_war_map, cover_list, ci[n], min_ci_k, min_idx) == True:
+                            self._taken_picture_list[n][min_idx] = [ci[n], picture_range_map]
+                            if len(self.config.VIDEO_OPTION) > 0:
+                                self._taken_picture[n][min_idx] = observations[n]["rgb"]   
+                            reward[n] += (ci[n] - min_ci_k)  
+                            ci[n] -= min_ci_k
+                        else:
+                            ci[n] = 0.0
+                else:
+                    ci[n] = 0.0
+                
+            reward = torch.tensor(
+                reward, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
+            exp_area = torch.tensor(
+                exp_area, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
+            distance = torch.tensor(
+                distance, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
+            ci= torch.tensor(
+                ci, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
+            object_num = torch.tensor(
+                object_num, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
 
-        self._init_envs(config, is_eval=True)
+            current_episode_reward += reward
+            current_episode_exp_area += exp_area
+            current_episode_distance += distance
+            current_episode_ci += ci
+            current_episode_object_num += object_num
+            next_episodes = self.envs.current_episodes()
+            envs_to_pause = []
 
-        self._agent = self._create_agent(None)
-        if (
-            self._agent.actor_critic.should_load_agent_state
-            and self.config.habitat_baselines.eval.should_load_ckpt
-        ):
-            self._agent.load_state_dict(ckpt_dict)
+            for i in range(n_envs):
+                if (
+                    next_episodes[i].scene_id,
+                    next_episodes[i].episode_id,
+                ) in stats_episodes:
+                    envs_to_pause.append(i)
+
+                # episode ended
+                if not_done_masks[i].item() == 0:
+                    """
+                    eval_take_picture_writer.write(str(len(stats_episodes)) + "," + str(current_episodes[i].episode_id) + "," + str(n))
+                    eval_picture_position_writer.write(str(len(stats_episodes)) + "," + str(current_episodes[i].episode_id) + "," + str(n))
+                    for j in range(self._num_picture):
+                        if j < len(self._taken_picture_list[i]):
+                            eval_take_picture_writer.write(str(self._taken_picture_list[i][j][0]))
+                            eval_picture_position_writer.write(str(self._taken_picture_list[i][j][1][0]) + "," + str(self._taken_picture_list[i][j][1][1]) + "," + str(self._taken_picture_list[i][j][1][2]))
+                        else:
+                            eval_take_picture_writer.write(" ")
+                            eval_picture_position_writer.write(" ")
+                        
+                    eval_take_picture_writer.writeLine()
+                    eval_picture_position_writer.writeLine()
+                    """
+                    
+                    pbar.update()
+                    episode_stats = dict()
+                    episode_stats["reward"] = current_episode_reward[i].item()
+                    episode_stats["exp_area"] = current_episode_exp_area[i].item()
+                    episode_stats["distance"] = current_episode_distance[i].item()
+                    episode_stats["ci"] = current_episode_ci[i].item()
+                    episode_stats["object_num"] = current_episode_object_num[i].item()
+                    
+                    episode_stats.update(
+                        self._extract_scalars_from_info(infos[i])
+                    )
+                    current_episode_reward[i] = 0
+                    current_episode_exp_area[i] = 0
+                    current_episode_distance[i] = 0
+                    current_episode_ci[i] = 0
+                    current_episode_object_num[i] = 0
+                    # use scene_id + episode_id as unique id for storing stats
+                    stats_episodes[
+                        (
+                            current_episodes[i].scene_id,
+                            current_episodes[i].episode_id,
+                        )
+                    ] = episode_stats
+                    
+                    raw_metrics_episodes[
+                        current_episodes[i].scene_id + '.' + 
+                        current_episodes[i].episode_id
+                    ] = infos[i]["raw_metrics"]
+                    
+                    _ci = 0.0
+                    for j in range(len(self._taken_picture_list[i])):
+                        _ci += self._taken_picture_list[i][j][0]
+                    eval_ci_logger.writeLine(str(_ci))
+
+                    if len(self.config.VIDEO_OPTION) > 0:
+                        if len(rgb_frames[i]) == 0:
+                            frame = observations_to_image(observations[i], infos[i], actions[i].cpu().numpy())
+                            rgb_frames[i].append(frame)
+                        picture = rgb_frames[i][-1]
+                        for j in range(50):
+                           rgb_frames[i].append(picture) 
+                        metrics=self._extract_scalars_from_info(infos[i])
+                        name_ci = 0.0
+                        
+                        for j in range(len(self._taken_picture_list[i])):
+                            name_ci += self._taken_picture_list[i][j][0]
+                        
+                        """
+                        current_area = exp_area[i] + exp_area_pre[i]
+                        name_ci = str(name_ci) + "-" + str(len(stats_episodes)) + "-" + str(current_area.item())
+                        """
+                        name_ci = str(name_ci) + "-" + str(len(stats_episodes))
+                        generate_video(
+                            video_option=self.config.VIDEO_OPTION,
+                            video_dir=self.config.VIDEO_DIR+"/"+date,
+                            images=rgb_frames[i],
+                            episode_id=current_episodes[i].episode_id,
+                            checkpoint_idx=checkpoint_index,
+                            metrics=metrics,
+                            name_ci=name_ci,
+                        )
+        
+                        # Save taken picture
+                        metric_strs = []
+                        in_metric = ['exp_area', 'ci', 'distance']
+                        for k, v in metrics.items():
+                            if k in in_metric:
+                                metric_strs.append(f"{k}={v:.2f}")
+                        
+                        name_p = 0.0  
+                            
+                        for j in range(len(self._taken_picture_list[i])):
+                            """
+                            eval_picture_top_logger = self.log_manager.createLogWriter("Picture/picture_top_" + str(current_episodes[i].episode_id) + "_" + str(j) + "_" + str(checkpoint_index))
+                
+                            for k in range(len(self._taken_picture_list[i][j][1])):
+                                for l in range(len(self._taken_picture_list[i][j][1][0])):
+                                    eval_picture_top_logger.write(str(self._taken_picture_list[i][j][1][k][l]))
+                                eval_picture_top_logger.writeLine()
+                            """
+                                
+                            name_p = self._taken_picture_list[i][j][0]
+                            picture_name = "episode=" + str(current_episodes[i].episode_id)+ "-ckpt=" + str(checkpoint_index) + "-" + str(j) + "-" + str(name_p)
+                            dir_name = "./taken_picture/" + date 
+                            if not os.path.exists(dir_name):
+                                os.makedirs(dir_name)
+                        
+                            picture = self._taken_picture[i][j]
+                            plt.figure()
+                            ax = plt.subplot(1, 1, 1)
+                            ax.axis("off")
+                            plt.imshow(picture)
+                            plt.subplots_adjust(left=0.1, right=0.95, bottom=0.05, top=0.95)
+                            path = dir_name + "/" + picture_name + ".png"
+                        
+                            plt.savefig(path)
+                        
+                        #Save score_matrics
+                        """
+                        if matrics[i] is not None:
+                            eval_matrics_logger = log_manager.createLogWriter("Matrics/matrics_" + str(current_episodes[i].episode_id) + "_" + str(checkpoint_index))
+                            for j in range(matrics[i].shape[0]):
+                                for k in range(matrics[i].shape[1]):
+                                    eval_matrics_logger.write(str(matrics[i][j][k]))
+                                eval_matrics_logger.writeLine("")
+                        """
+                            
+                            
+                        rgb_frames[i] = []
+                        
+                    self._taken_picture[i] = []
+                    self._taken_picture_list[i] = []
+                    self._target_index_list[i] = [maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2]
+                    self._taken_index_list[i] = []
+
+                # episode continues
+                elif len(self.config.VIDEO_OPTION) > 0:
+                    frame = observations_to_image(observations[i], infos[i], actions[i].cpu().numpy())
+                    rgb_frames[i].append(frame)
+
+            (
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                current_episode_exp_area,
+                current_episode_distance,
+                current_episode_ci,
+                current_episode_object_num,
+                prev_actions,
+                batch,
+                rgb_frames,
+            ) = self._pause_envs(
+                envs_to_pause,
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                current_episode_exp_area,
+                current_episode_distance,
+                current_episode_ci,
+                current_episode_object_num,
+                prev_actions,
+                batch,
+                rgb_frames,
+            )
+
+        num_episodes = len(stats_episodes)
+        
+        aggregated_stats = dict()
+        for stat_key in next(iter(stats_episodes.values())).keys():
+            aggregated_stats[stat_key] = (
+                sum([v[stat_key] for v in stats_episodes.values()])
+                / num_episodes
+            )
+
+        for k, v in aggregated_stats.items():
+            logger.info(f"Average episode {k}: {v:.4f}")
+        
+
 
         step_id = checkpoint_index
         if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
             step_id = ckpt_dict["extra_state"]["step"]
+        
+        eval_reward_logger.writeLine(str(step_id) + "," + str(aggregated_stats["reward"]))
 
-        evaluator = hydra.utils.instantiate(config.habitat_baselines.evaluator)
-        assert isinstance(evaluator, Evaluator)
-        evaluator.evaluate_agent(
-            self._agent,
-            self.envs,
-            self.config,
-            checkpoint_index,
-            step_id,
-            writer,
-            self.device,
-            self.obs_transforms,
-            self._env_spec,
-            self._rank0_keys,
-        )
+        metrics = {k: v for k, v in aggregated_stats.items() if k != "reward"}
+
+        logger.info("CI:" + str(metrics["ci"]))
+        eval_metrics_logger.writeLine(str(step_id) + "," + str(metrics["ci"]) + "," + str(metrics["exp_area"]) + "," + str(metrics["distance"]) + "," + str(metrics["raw_metrics.agent_path_length"]) + "," + str(metrics["object_num"]))
 
         self.envs.close()
+        
+        
+    def _grad_cam_checkpoint(
+        self,
+        checkpoint_path: str,
+        log_manager: LogManager,
+        date: str,
+        checkpoint_index: int = 0,
+    ) -> None:
+        
+        self.log_manager = log_manager
+        #ログ出力設定
+        #time, reward
+        grad_reward_logger = self.log_manager.createLogWriter("reward")
+        #time, ci, exp_area, distance. path_length
+        grad_metrics_logger = self.log_manager.createLogWriter("metrics")
+        
+        # Map location CPU is almost always better than mapping to a CUDA device.
+        ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
+        print("PATH")
+        print(checkpoint_path)
+
+        if self.config.EVAL.USE_CKPT_CONFIG:
+            config = self._setup_eval_config(ckpt_dict["config"])
+        else:
+            config = self.config.clone()
+
+        ppo_cfg = config.RL.PPO
+
+        config.defrost()
+        config.TASK_CONFIG.DATASET.SPLIT = config.EVAL.SPLIT
+        config.freeze()
+
+        if len(self.config.VIDEO_OPTION) > 0:
+            config.defrost()
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP")
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("COLLISIONS")
+            config.freeze()
+
+        logger.info(f"env config: {config}")
+        
+        self.device = (
+            torch.device("cuda", self.config.TORCH_GPU_ID)
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        
+        self.envs = construct_envs(config, get_env_class(config.ENV_NAME))
+        self._setup_actor_critic_agent(ppo_cfg)
+
+        self.agent.load_state_dict(ckpt_dict["state_dict"])
+        self.actor_critic = self.agent.actor_critic
+        
+        self._taken_picture = []
+        self._taken_picture_list = []
+        self._target_index_list = []
+        self._taken_index_list = []
+        # 1回のCIを保存
+        self._observed_object_ci_one = []
+        
+        for i in range(self.envs.num_envs):
+            self._taken_picture.append([])
+            self._taken_picture_list.append([])
+            self._target_index_list.append([maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2])
+            self._taken_index_list.append([])
+            self._observed_object_ci_one.append([0, 0, 0])
+        
+        observations = self.envs.reset()
+        batch = batch_obs(observations, device=self.device)
+
+        current_episode_reward = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_exp_area = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_distance = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_ci = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        current_episode_object_num = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+        
+        test_recurrent_hidden_states = torch.zeros(
+            self.actor_critic.net.num_recurrent_layers,
+            self.config.NUM_PROCESSES,
+            ppo_cfg.hidden_size,
+            device=self.device,
+        )
+        prev_actions = torch.zeros(
+            self.config.NUM_PROCESSES, 1, device=self.device, dtype=torch.long
+        )
+        not_done_masks = torch.zeros(
+            self.config.NUM_PROCESSES, 1, device=self.device
+        )
+        stats_episodes = dict()  # dict of dicts that stores stats per episode
+        raw_metrics_episodes = dict()
+
+        rgb_frames = [
+            [] for _ in range(self.config.NUM_PROCESSES)
+        ]  # type: List[List[np.ndarray]]
+        if len(self.config.VIDEO_OPTION) > 0:
+            os.makedirs(self.config.VIDEO_DIR+"/"+date, exist_ok=True)
+
+        pbar = tqdm.tqdm(total=self.config.TEST_EPISODE_COUNT)
+        self.actor_critic.eval()
+        
+        #################################
+        #Grad Camで使う層を決める(まずはRGBだけ)
+        target_layers_rgb = [self.actor_critic.net.visual_encoder.cnn[-4]]
+        cam = GradCAM(
+            model=self.actor_critic.net.visual_encoder, target_layers=target_layers_rgb
+        )
+        #################################
+        step_num = 0
+        
+        while (
+            len(stats_episodes) < self.config.TEST_EPISODE_COUNT
+            and self.envs.num_envs > 0
+        ):
+            current_episodes = self.envs.current_episodes()
+
+            with torch.no_grad():
+                (
+                    _,
+                    actions,
+                    _,
+                    test_recurrent_hidden_states,
+                ) = self.actor_critic.act(
+                    batch,
+                    test_recurrent_hidden_states,
+                    prev_actions,
+                    not_done_masks,
+                    deterministic=False,
+                )
+
+                prev_actions.copy_(actions)
+                
+            #################################
+            #policy_gradcam(self.actor_critic.net.visual_encoder, observations[0])
+            
+            # Grad Camについて
+            cnn_input = []
+            logger.info("SHAPE1: " + str(len(observations)))
+            logger.info("SHAPE3: " + str(observations[0]["rgb"].shape))
+            if self.actor_critic.net.visual_encoder._n_input_rgb > 0:
+                rgb_observations = torch.from_numpy(observations[0]["rgb"]).clone()
+                # permute tensor to dimension [BATCH x CHANNEL x HEIGHT X WIDTH]
+                rgb_observations = rgb_observations.permute(2, 0, 1)
+                rgb_observations = rgb_observations / 255.0  # normalize RGB
+                cnn_input.append(rgb_observations)
+
+            if self.actor_critic.net.visual_encoder._n_input_depth > 0:
+                depth_observations = torch.from_numpy(observations[0]["depth"]).clone()
+                # permute tensor to dimension [BATCH x CHANNEL x HEIGHT X WIDTH]
+                depth_observations = depth_observations.permute(2, 0, 1)
+                cnn_input.append(depth_observations)
+
+            cnn_input = torch.cat(cnn_input, dim=0)
+            grayscale_cam = cam(
+                input_tensor=cnn_input,
+                targets=[ClassifierOutputTarget(actions[0])],
+            )
+            # 最初の出力だけ取得
+            grayscale_cam = grayscale_cam[0, :]
+            visualization = show_cam_on_image(observations[0]["RGB"].permute(0, 3, 1, 2).numpy(), grayscale_cam, use_rgb=True)
+            fig, ax = plt.subplots(1,2)
+            ax[0].imshow(img.permute(1, 2, 0).numpy())
+            ax[1].imshow(visualization)
+            
+            dir_name = "./taken_grad/" + date
+            if not os.path.exists(dir_name):
+                os.makedirs(dir_name)
+            picture_name = "episode=" + str(current_episodes[i].episode_id)+ "-" + str(step_num) + "-" + str(actions[0])
+            path = dir_name + "/" + picture_name + ".png"
+            plt.savefig(path)
+            #################################
+
+            outputs = self.envs.step([a[0].item() for a in actions])
+ 
+            observations, rewards, dones, infos = [
+                list(x) for x in zip(*outputs)
+            ]
+            batch = batch_obs(observations, device=self.device)
+            
+            not_done_masks = torch.tensor(
+                [[0.0] if done else [1.0] for done in dones],
+                dtype=torch.float,
+                device=self.device,
+            )
+            
+            for n in range(self.envs.num_envs):
+                self._observed_object_ci_one[n] = [0, 0, 0] 
+            
+            reward = []
+            ci = []
+            exp_area = [] # 探索済みのエリア()
+            exp_area_pre = []
+            distance = []
+            fog_of_war_map = []
+            top_down_map = [] 
+            top_map = []
+            object_num = []
+            n_envs = self.envs.num_envs
+            
+            for i in range(n_envs):
+                reward.append(rewards[i][0][0])
+                ci.append(rewards[i][0][1])
+                exp_area.append(rewards[i][0][2]-rewards[i][0][3])
+                exp_area_pre.append(rewards[i][0][3])
+                fog_of_war_map.append(infos[i]["picture_range_map"]["fog_of_war_mask"])
+                top_down_map.append(infos[i]["picture_range_map"]["map"])
+                top_map.append(infos[i]["top_down_map"]["map"])
+                object_num.append(0)
+                
+                # multi goal distanceの計算
+                dis = 0.0
+                dis_pre = 0
+                for j in self._target_index_list[i]:
+                    dis_pre += rewards[i][0][5][j-maps.MAP_TARGET_POINT_INDICATOR]
+                    dis += rewards[i][0][4][j-maps.MAP_TARGET_POINT_INDICATOR]
+            
+                reward[i] += dis_pre - dis
+                distance.append(dis_pre - dis)
+            
+            for n in range(len(observations)):
+            #TAKE_PICTUREが呼び出されたかを検証
+                if ci[n] != -sys.float_info.max:
+                    # 今回撮ったpicture(p_n)が保存してあるpicture(p_k)とかぶっているkを保存
+                    cover_list = [] 
+                    picture_range_map = self._create_picture_range_map(top_down_map[n], fog_of_war_map[n])
+                    ci[n], object_num[n] = self._do_take_picture_object(top_map, fog_of_war_map, n)
+                    
+                    if ci[n] == 0:
+                        continue
+                    
+                    # p_kのそれぞれのpicture_range_mapのリスト
+                    pre_fog_of_war_map = [sublist[1] for sublist in self._taken_picture_list[n]]
+                        
+                    # それぞれと閾値より被っているか計算
+                    idx = -1
+                    min_ci = ci[n]
+                    for k in range(len(pre_fog_of_war_map)):
+                        # 閾値よりも被っていたらcover_listにkを追加
+                        if self._check_percentage_of_fog(picture_range_map, pre_fog_of_war_map[k]) == True:
+                            cover_list.append(k)
+                                
+                        #ciの最小値の写真を探索(１つも被っていない時用)
+                        if min_ci < self._taken_picture_list[n][idx][0]:
+                            idx = k
+                            min_ci = self._taken_picture_list[n][idx][0]
+                            
+                    # 今までの写真と多くは被っていない時
+                    if len(cover_list) == 0:
+                        #範囲が多く被っていなくて、self._num_picture回未満写真を撮っていたらそのまま保存
+                        if len(self._taken_picture_list[n]) != self._num_picture:
+                            self._taken_picture_list[n].append([ci[n], picture_range_map])
+                            if len(self.config.VIDEO_OPTION) > 0:
+                                self._taken_picture[n].append(observations[n]["rgb"])
+                            reward[n] += ci[n]
+                                
+                        #範囲が多く被っていなくて、self._num_picture回以上写真を撮っていたら
+                        else:
+                            # 今回の写真が保存してある写真の１つでもCIが高かったらCIが最小の保存写真と入れ替え
+                            if idx != -1:
+                                ci_pre = self._taken_picture_list[n][idx][0]
+                                self._taken_picture_list[n][idx] = [ci[n], picture_range_map]
+                                if len(self.config.VIDEO_OPTION) > 0:
+                                    self._taken_picture[n][idx] = observations[n]["rgb"]   
+                                reward[n] += (ci[n] - ci_pre) 
+                                ci[n] -= ci_pre
+                            else:
+                                ci[n] = 0.0    
+                            
+                    # 1つとでも多く被っていた時    
+                    else:
+                        min_idx = -1
+                        min_ci_k = 1000
+                        # 多く被った写真のうち、ciが最小のものを計算
+                        for k in range(len(cover_list)):
+                            idx_k = cover_list[k]
+                            if self._taken_picture_list[n][idx_k][0] < min_ci_k:
+                                min_ci_k = self._taken_picture_list[n][idx_k][0]
+                                min_idx = idx_k
+                                    
+                        # 被った割合分小さくなったCIでも保存写真の中の最小のCIより大きかったら交換
+                        if self._compareWithChangedCI(picture_range_map, pre_fog_of_war_map, cover_list, ci[n], min_ci_k, min_idx) == True:
+                            self._taken_picture_list[n][min_idx] = [ci[n], picture_range_map]
+                            if len(self.config.VIDEO_OPTION) > 0:
+                                self._taken_picture[n][min_idx] = observations[n]["rgb"]   
+                            reward[n] += (ci[n] - min_ci_k)  
+                            ci[n] -= min_ci_k
+                        else:
+                            ci[n] = 0.0
+                else:
+                    ci[n] = 0.0
+                
+            reward = torch.tensor(reward, dtype=torch.float, device=self.device).unsqueeze(1)
+            exp_area = torch.tensor(exp_area, dtype=torch.float, device=self.device).unsqueeze(1)
+            distance = torch.tensor(distance, dtype=torch.float, device=self.device).unsqueeze(1)
+            ci= torch.tensor(ci, dtype=torch.float, device=self.device).unsqueeze(1)
+            object_num = torch.tensor(object_num, dtype=torch.float, device=self.device).unsqueeze(1)
+
+            current_episode_reward += reward
+            current_episode_exp_area += exp_area
+            current_episode_distance += distance
+            current_episode_ci += ci
+            current_episode_object_num += object_num
+            next_episodes = self.envs.current_episodes()
+            envs_to_pause = []
+
+            for i in range(n_envs):
+                if (
+                    next_episodes[i].scene_id,
+                    next_episodes[i].episode_id,
+                ) in stats_episodes:
+                    envs_to_pause.append(i)
+
+                # episode ended
+                if not_done_masks[i].item() == 0:
+                    pbar.update()
+                    episode_stats = dict()
+                    episode_stats["reward"] = current_episode_reward[i].item()
+                    episode_stats["exp_area"] = current_episode_exp_area[i].item()
+                    episode_stats["distance"] = current_episode_distance[i].item()
+                    episode_stats["ci"] = current_episode_ci[i].item()
+                    episode_stats["object_num"] = current_episode_object_num[i].item()
+                    
+                    episode_stats.update(
+                        self._extract_scalars_from_info(infos[i])
+                    )
+                    current_episode_reward[i] = 0
+                    current_episode_exp_area[i] = 0
+                    current_episode_distance[i] = 0
+                    current_episode_ci[i] = 0
+                    current_episode_object_num[i] = 0
+                    # use scene_id + episode_id as unique id for storing stats
+                    stats_episodes[
+                        (
+                            current_episodes[i].scene_id,
+                            current_episodes[i].episode_id,
+                        )
+                    ] = episode_stats
+                    
+                    raw_metrics_episodes[
+                        current_episodes[i].scene_id + '.' + 
+                        current_episodes[i].episode_id
+                    ] = infos[i]["raw_metrics"]
+
+                    if len(self.config.VIDEO_OPTION) > 0:
+                        if len(rgb_frames[i]) == 0:
+                            frame = observations_to_image(observations[i], infos[i], actions[i].cpu().numpy())
+                            rgb_frames[i].append(frame)
+                        picture = rgb_frames[i][-1]
+                        for j in range(50):
+                           rgb_frames[i].append(picture) 
+                        metrics=self._extract_scalars_from_info(infos[i])
+                        name_ci = 0.0
+                        
+                        for j in range(len(self._taken_picture_list[i])):
+                            name_ci += self._taken_picture_list[i][j][0]
+                        
+                        name_ci = str(name_ci) + "-" + str(len(stats_episodes))
+                        generate_video(
+                            video_option=self.config.VIDEO_OPTION,
+                            video_dir=self.config.VIDEO_DIR+"/"+date,
+                            images=rgb_frames[i],
+                            episode_id=current_episodes[i].episode_id,
+                            checkpoint_idx=checkpoint_index,
+                            metrics=metrics,
+                            tb_writer=writer,
+                            name_ci=name_ci,
+                        )
+        
+                        # Save taken picture
+                        metric_strs = []
+                        in_metric = ['exp_area', 'ci', 'distance']
+                        for k, v in metrics.items():
+                            if k in in_metric:
+                                metric_strs.append(f"{k}={v:.2f}")
+                        
+                        name_p = 0.0  
+                            
+                        for j in range(len(self._taken_picture_list[i])):                
+                            name_p = self._taken_picture_list[i][j][0]
+                            picture_name = "episode=" + str(current_episodes[i].episode_id)+ "-ckpt=" + str(checkpoint_index) + "-" + str(j) + "-" + str(name_p)
+                            dir_name = "./taken_picture/" + date 
+                            if not os.path.exists(dir_name):
+                                os.makedirs(dir_name)
+                        
+                            picture = self._taken_picture[i][j]
+                            plt.figure()
+                            ax = plt.subplot(1, 1, 1)
+                            ax.axis("off")
+                            plt.imshow(picture)
+                            plt.subplots_adjust(left=0.1, right=0.95, bottom=0.05, top=0.95)
+                            path = dir_name + "/" + picture_name + ".png"
+                        
+                            plt.savefig(path)
+                            
+                        rgb_frames[i] = []
+                        
+                    self._taken_picture[i] = []
+                    self._taken_picture_list[i] = []
+                    self._target_index_list[i] = [maps.MAP_TARGET_POINT_INDICATOR, maps.MAP_TARGET_POINT_INDICATOR+1, maps.MAP_TARGET_POINT_INDICATOR+2]
+                    self._taken_index_list[i] = []
+
+                # episode continues
+                elif len(self.config.VIDEO_OPTION) > 0:
+                    frame = observations_to_image(observations[i], infos[i], actions[i].cpu().numpy())
+                    rgb_frames[i].append(frame)
+                    step_num += 1
+
+            (
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                current_episode_exp_area,
+                current_episode_distance,
+                current_episode_ci,
+                current_episode_object_num,
+                prev_actions,
+                batch,
+                rgb_frames,
+            ) = self._pause_envs(
+                envs_to_pause,
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                current_episode_exp_area,
+                current_episode_distance,
+                current_episode_ci,
+                current_episode_object_num,
+                prev_actions,
+                batch,
+                rgb_frames,
+            )
+
+        num_episodes = len(stats_episodes)
+        
+        aggregated_stats = dict()
+        for stat_key in next(iter(stats_episodes.values())).keys():
+            aggregated_stats[stat_key] = (
+                sum([v[stat_key] for v in stats_episodes.values()])
+                / num_episodes
+            )
+
+        for k, v in aggregated_stats.items():
+            logger.info(f"Average episode {k}: {v:.4f}")
+        
 
 
-def get_device(config: "DictConfig") -> torch.device:
-    if torch.cuda.is_available():
-        device = torch.device("cuda", config.habitat_baselines.torch_gpu_id)
-        torch.cuda.set_device(device)
-        return device
-    else:
-        return torch.device("cpu")
+        step_id = checkpoint_index
+        if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
+            step_id = ckpt_dict["extra_state"]["step"]
+        
+        grad_reward_logger.writeLine(str(step_id) + "," + str(aggregated_stats["reward"]))
+
+        metrics = {k: v for k, v in aggregated_stats.items() if k != "reward"}
+
+        logger.info("CI:" + str(metrics["ci"]))
+        grad_metrics_logger.writeLine(str(step_id) + "," + str(metrics["ci"]) + "," + str(metrics["exp_area"]) + "," + str(metrics["distance"]) + "," + str(metrics["raw_metrics.agent_path_length"]) + "," + str(metrics["object_num"]))
+
+        self.envs.close()
+    
+
+def policy_gradcam(net, observations):
+    net.eval()
+    net.zero_grad()
+
+    def __extract(grad):
+        global feature_grad
+        feature_grad = grad
+
+    cnn_input = []
+    if net._n_input_rgb > 0:
+        rgb_observations = observations["rgb"]
+        # permute tensor to dimension [BATCH x CHANNEL x HEIGHT X WIDTH]
+        rgb_observations = rgb_observations.permute(0, 3, 1, 2)
+        rgb_observations = rgb_observations / 255.0  # normalize RGB
+        cnn_input.append(rgb_observations)
+
+    if net._n_input_depth > 0:
+        depth_observations = observations["depth"]
+        # permute tensor to dimension [BATCH x CHANNEL x HEIGHT X WIDTH]
+        depth_observations = depth_observations.permute(0, 3, 1, 2)
+        cnn_input.append(depth_observations)
+
+    cnn_input = torch.cat(cnn_input, dim=1)
+    
+
+    # get features from the last convolutional layer
+    target_layers_rgb = self.actor_critic.net.visual_encoder.cnn[:-4]
+    features = target_layers_rgb(cnn_input)
+    
+    
+    
+    x = net.conv1(input)
+    x = F.relu(net.norm1(x))
+    x = net.blocks(x)
+    features = x
+
+    # hook for the gradients
+    def __extract_grad(grad):
+        global feature_grad
+        feature_grad = grad
+    features.register_hook(__extract_grad)
+
+    # get the output from the whole VGG architecture
+    x = net.policy_conv(x)
+    output = net.policy_bias(torch.flatten(x, 1))
+    pred = torch.argmax(output).item()
+    p_trans_display(pred)
+    pred = 50
+
+    # get the gradient of the output
+    output[:, pred].backward()
+
+    # pool the gradients across the channels
+    pooled_grad = torch.mean(feature_grad, dim=[0, 2, 3])
+    print(pooled_grad)
+
+    # weight the channels with the corresponding gradients
+    # (L_Grad-CAM = alpha * A)
+    features = features.detach()
+    print(features.size())
+    for i in range(features.shape[1]):
+        features[:, i, :, :] *= pooled_grad[i] 
+
+    # average the channels and create an heatmap
+    # ReLU(L_Grad-CAM)
+    heatmap = torch.mean(features, dim=1).squeeze()
+    heatmap = np.maximum(heatmap, 0)
+
+    # normalization for plotting
+    heatmap = heatmap / torch.max(heatmap)
+    heatmap = heatmap.numpy()
+    heatmap = np.rot90(heatmap,-1)
+    sns.heatmap(heatmap, cmap='viridis')
+    """
+    # project heatmap onto the input image
+    img = cv2.imread("C:/Users/yokuk/Desktop/W4S/0.Lab/Test_Program/pydlshogi2/network/ban.png")
+    heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    superimposed_img = heatmap * 0.4 + img
+    superimposed_img = np.uint8(255 * superimposed_img / np.max(superimposed_img))
+    superimposed_img = cv2.cvtColor(superimposed_img, cv2.COLOR_BGR2RGB)
+    plt.imshow(superimposed_img)
+    """
+    plt.show()

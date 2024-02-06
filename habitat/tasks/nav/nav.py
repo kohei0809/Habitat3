@@ -84,9 +84,11 @@ class MaximumInformationEpisode(Episode):
     start_room: Optional[str] = None
     
     shortest_paths: Optional[List[ShortestPathPoint]] = None
+    """
     goals: List[NavigationGoal] = attr.ib(
         default=None, validator=not_none_validator
     )
+    """
     object_category: Optional[List[str]] = None
     object_index: Optional[int] = None
     currGoalIndex: Optional[int] = 0 

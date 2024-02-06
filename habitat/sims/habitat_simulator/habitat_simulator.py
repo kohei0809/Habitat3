@@ -180,7 +180,7 @@ class HabitatSim(Simulator):
 
         self._sensor_suite = SensorSuite(sim_sensors)
         self.sim_config = self.create_sim_config(self._sensor_suite)
-        self._current_scene = self.sim_config.sim_cfg.scene.id
+        self._current_scene = self.sim_config.sim_cfg.scene_id
         self._sim = habitat_sim.Simulator(self.sim_config)
         self._action_space = spaces.Discrete(
             len(self.sim_config.agents[0].action_space)
@@ -194,7 +194,7 @@ class HabitatSim(Simulator):
         overwrite_config(
             config_from=self.config.HABITAT_SIM_V0, config_to=sim_config
         )
-        sim_config.scene.id = self.config.SCENE
+        sim_config.scene_id = self.config.SCENE
         agent_config = habitat_sim.AgentConfiguration()
         overwrite_config(
             config_from=self._get_agent_config(), config_to=agent_config
@@ -202,7 +202,7 @@ class HabitatSim(Simulator):
 
         sensor_specifications = []
         for sensor in _sensor_suite.sensors.values():
-            sim_sensor_cfg = habitat_sim.SensorSpec()
+            sim_sensor_cfg = habitat_sim.CameraSensorSpec()
             overwrite_config(
                 config_from=sensor.config, config_to=sim_sensor_cfg
             )
@@ -210,7 +210,7 @@ class HabitatSim(Simulator):
             sim_sensor_cfg.resolution = list(
                 sensor.observation_space.shape[:2]
             )
-            sim_sensor_cfg.parameters["hfov"] = str(sensor.config.HFOV)
+            #sim_sensor_cfg.parameters["hfov"] = str(sensor.config.HFOV)
 
             # TODO(maksymets): Add configure method to Sensor API to avoid
             # accessing child attributes through parent interface

@@ -3,10 +3,13 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
+import inspect
+import os.path as osp
 from typing import List, Optional, Union
 
 import yacs.config
+
+_HABITAT_CFG_DIR = osp.dirname(inspect.getabsfile(inspect.currentframe()))
 
 # from habitat.config import Config as CN # type: ignore
 
@@ -388,7 +391,7 @@ _C.SIMULATOR.HABITAT_SIM_V0.GPU_GPU = False
 _C.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING = True
 _C.SIMULATOR.HABITAT_SIM_V0.ENABLE_PHYSICS = True ## change from False
 _C.SIMULATOR.HABITAT_SIM_V0.PHYSICS_CONFIG_FILE = (
-    "./data/default.phys_scene_config.json"
+    "./data/default.physics_config.json"
 )
 # -----------------------------------------------------------------------------
 # PYROBOT

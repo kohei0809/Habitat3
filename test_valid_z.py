@@ -1,4 +1,5 @@
 import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import random
 
 import numpy as np
@@ -43,10 +44,10 @@ def research_valid_z():
     config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.MIN_DEPTH = 0.0
     config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.MAX_DEPTH = 5.0
     config.TASK_CONFIG.SIMULATOR.AGENT_0.HEIGHT = 1.5
-    config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS = ["RGB_SENSOR", "DEPTH_SENSOR", "SEMANTIC_SENSOR"]
+    config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS = ["RGB_SENSOR", "DEPTH_SENSOR"]
     config.TASK_CONFIG.SIMULATOR.SEMANTIC_SENSOR.HEIGHT = 256
     config.TASK_CONFIG.SIMULATOR.SEMANTIC_SENSOR.WIDTH = 256
-    config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.PHYSICS_CONFIG_FILE = ("./data/default.phys_scene_config.json")
+    #config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.PHYSICS_CONFIG_FILE = ("data/default.phys_scene_config.json")
     config.TASK_CONFIG.TRAINER_NAME = "oracle-ego"
     config.TASK_CONFIG.DATASET.DATA_PATH = dataset_path
     config.freeze()
@@ -58,35 +59,28 @@ def research_valid_z():
     sim = HabitatSim(config=config.TASK_CONFIG.SIMULATOR)
     dataset.episodes += generate_maximuminfo_episode(sim=sim, num_episodes=num)         
         
-    position_list = []
-    num_list = []
+    logger.info("Create datasets")
+    position_dict = {}
     for i in range(len(dataset.episodes)):
         position = dataset.episodes[i].start_position[1]
-            
-        if position in position_list:
-            idx = position_list.index(position)
-            num_list[idx] += 1
-        else:
-            position_list.append(position)
-            num_list.append(1)
+        
+        num_pos = position_dict.get(position, 0)
+        position_dict[position] = num_pos+1
                 
-    logger.info("LIST_SIZE: " + str(len(position_list)))
+    logger.info("LIST_SIZE: " + str(len(position_dict)))
         
     #z軸が少数だったものは削除
-    to_delete = []
-    for i, n in enumerate(num_list):
-        if n < (num/10):
-            to_delete.append(i)
+    sorted_positions = sorted(position_dict.items(), key=lambda x: x[1], reverse=True)
+
+    # valueが1000以上の位置情報のみを抽出してリストに格納
+    num_list = [(key, value) for key, value in sorted_positions if value >= 1000]
+
+    # num_listに入れたkeyとそのvalueをprint
+    logger.info(scene_name)
+    for key, value in num_list:
+        print(f"Position: {key}, Value: {value}")
         
-    for i in reversed(to_delete):
-        num_list.pop(i)
-        position_list.pop(i)
-             
-    logger.info("POSITION_LIST: " + str(len(position_list)))    
-    for i in range(len(position_list)):
-        logger.info(str(position_list[i])+ ", " + str(num_list[i]))
-        
-    z_list = position_list
+    z_list = num_list
              
                 
 if __name__ == '__main__':

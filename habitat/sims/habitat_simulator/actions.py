@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright (c) Meta Platforms, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -9,16 +9,20 @@ from typing import Dict
 
 import attr
 
+import habitat_sim
+from habitat.core.registry import registry
+from habitat.core.simulator import ActionSpaceConfiguration, Config
 from habitat.core.utils import Singleton
 
 
 class _DefaultHabitatSimActions(Enum):
-    stop = 0
-    move_forward = 1
-    turn_left = 2
-    turn_right = 3
-    look_up = 4
-    look_down = 5
+    STOP = 0
+    MOVE_FORWARD = 1
+    TURN_LEFT = 2
+    TURN_RIGHT = 3
+    LOOK_UP = 4
+    LOOK_DOWN = 5
+    FOUND=6
 
 
 @attr.s(auto_attribs=True, slots=True)
@@ -30,7 +34,7 @@ class HabitatSimActionsSingleton(metaclass=Singleton):
     be removed nor can their mapping be altered. This also ensures that all
     actions are always contigously mapped in :py:`[0, len(HabitatSimActions) - 1]`
 
-    This accesible as the global singleton :ref:`HabitatSimActions`
+    This accesible as the global singleton `HabitatSimActions`
     """
 
     _known_actions: Dict[str, int] = attr.ib(init=False, factory=dict)
@@ -40,7 +44,7 @@ class HabitatSimActionsSingleton(metaclass=Singleton):
             self._known_actions[action.name] = action.value
 
     def extend_action_space(self, name: str) -> int:
-        r"""Extends the action space to accommodate a new action with
+        r"""Extends the action space to accomodate a new action with
         the name :p:`name`
 
         :param name: The name of the new action
@@ -84,3 +88,90 @@ class HabitatSimActionsSingleton(metaclass=Singleton):
 
 
 HabitatSimActions: HabitatSimActionsSingleton = HabitatSimActionsSingleton()
+
+
+@registry.register_action_space_configuration(name="v0")
+class HabitatSimV0ActionSpaceConfiguration(ActionSpaceConfiguration):
+    def get(self):
+        return {
+            HabitatSimActions.STOP: habitat_sim.ActionSpec("stop"),
+            HabitatSimActions.MOVE_FORWARD: habitat_sim.ActionSpec(
+                "move_forward",
+                habitat_sim.ActuationSpec(
+                    amount=self.config.FORWARD_STEP_SIZE
+                ),
+            ),
+            HabitatSimActions.TURN_LEFT: habitat_sim.ActionSpec(
+                "turn_left",
+                habitat_sim.ActuationSpec(amount=self.config.TURN_ANGLE),
+            ),
+            HabitatSimActions.TURN_RIGHT: habitat_sim.ActionSpec(
+                "turn_right",
+                habitat_sim.ActuationSpec(amount=self.config.TURN_ANGLE),
+            ),
+        }
+
+
+@registry.register_action_space_configuration(name="v1")
+class HabitatSimV1ActionSpaceConfiguration(
+    HabitatSimV0ActionSpaceConfiguration
+):
+    def get(self):
+        config = super().get()
+        new_config = {
+            HabitatSimActions.LOOK_UP: habitat_sim.ActionSpec(
+                "look_up",
+                habitat_sim.ActuationSpec(amount=self.config.TILT_ANGLE),
+            ),
+            HabitatSimActions.LOOK_DOWN: habitat_sim.ActionSpec(
+                "look_down",
+                habitat_sim.ActuationSpec(amount=self.config.TILT_ANGLE),
+            ),
+        }
+
+        config.update(new_config)
+
+        return config
+
+
+@registry.register_action_space_configuration(name="pyrobotnoisy")
+class HabitatSimPyRobotActionSpaceConfiguration(ActionSpaceConfiguration):
+    def get(self):
+        return {
+            HabitatSimActions.STOP: habitat_sim.ActionSpec("stop"),
+            HabitatSimActions.MOVE_FORWARD: habitat_sim.ActionSpec(
+                "pyrobot_noisy_move_forward",
+                habitat_sim.PyRobotNoisyActuationSpec(
+                    amount=self.config.FORWARD_STEP_SIZE,
+                    robot=self.config.NOISE_MODEL.ROBOT,
+                    controller=self.config.NOISE_MODEL.CONTROLLER,
+                    noise_multiplier=self.config.NOISE_MODEL.NOISE_MULTIPLIER,
+                ),
+            ),
+            HabitatSimActions.TURN_LEFT: habitat_sim.ActionSpec(
+                "pyrobot_noisy_turn_left",
+                habitat_sim.PyRobotNoisyActuationSpec(
+                    amount=self.config.TURN_ANGLE,
+                    robot=self.config.NOISE_MODEL.ROBOT,
+                    controller=self.config.NOISE_MODEL.CONTROLLER,
+                    noise_multiplier=self.config.NOISE_MODEL.NOISE_MULTIPLIER,
+                ),
+            ),
+            HabitatSimActions.TURN_RIGHT: habitat_sim.ActionSpec(
+                "pyrobot_noisy_turn_right",
+                habitat_sim.PyRobotNoisyActuationSpec(
+                    amount=self.config.TURN_ANGLE,
+                    robot=self.config.NOISE_MODEL.ROBOT,
+                    controller=self.config.NOISE_MODEL.CONTROLLER,
+                    noise_multiplier=self.config.NOISE_MODEL.NOISE_MULTIPLIER,
+                ),
+            ),
+            HabitatSimActions.LOOK_UP: habitat_sim.ActionSpec(
+                "look_up",
+                habitat_sim.ActuationSpec(amount=self.config.TILT_ANGLE),
+            ),
+            HabitatSimActions.LOOK_DOWN: habitat_sim.ActionSpec(
+                "look_down",
+                habitat_sim.ActuationSpec(amount=self.config.TILT_ANGLE),
+            ),
+        }
